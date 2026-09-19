@@ -15,6 +15,19 @@ from starlette.routing import Mount
 
 import oauth
 from authorize_page import render_authorize_page
+from graphql_ops import (
+    Q_GET_BUILD_LOGS,
+    Q_GET_DEPLOYMENTS,
+    Q_GET_ME,
+    Q_GET_RUNTIME_LOGS,
+    Q_GET_SERVICE,
+    Q_LIST_PROJECTS,
+    Q_LIST_REGIONS,
+    Q_LIST_SERVICES,
+    Q_SCAN_PROJECTS,
+    Q_SCAN_RUNTIME_LOGS,
+    Q_SCAN_SERVICES,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -149,19 +162,7 @@ async def list_projects() -> str:
     """列出所有 Zeabur 项目，返回 project_id、项目名和环境列表（含 环境id）。
     查日志前先调用此工具获取 project_id 和 环境id。"""
     try:
-        data = await gql("""
-            query {
-              projects(skip: 0, limit: 100) {
-                edges {
-                  node {
-                    _id
-                    name
-                    environments { _id name }
-                  }
-                }
-              }
-            }
-        """)
+        data = await gql(Q_LIST_PROJECTS)
         if "error" in data:
             return f"❌ {data['error']}"
         edges = data.get("projects", {}).get("edges", [])
@@ -183,15 +184,7 @@ async def list_projects() -> str:
 async def list_services(project_id: str) -> str:
     """列出指定项目下的所有服务，返回服务名和 service_id。"""
     try:
-        data = await gql("""
-            query ListServices($projectID: ObjectID!) {
-              services(projectID: $projectID) {
-                edges {
-                  node { _id name }
-                }
-              }
-            }
-        """, {"projectID": project_id})
+        data = await gql(Q_LIST_SERVICES, {"projectID": project_id})
         if "error" in data:
             return f"❌ {data['error']}"
         edges = data.get("services", {}).get("edges", [])
@@ -211,14 +204,7 @@ async def get_runtime_logs(service_id: str, environment_id: str, project_id: str
     """获取服务运行时日志（启动输出、报错等）。
     service_id 从 list_services 获取，environment_id 和 project_id 从 list_projects 获取。"""
     try:
-        data = await gql("""
-            query RuntimeLogs($projectID: ObjectID!, $serviceID: ObjectID!, $environmentID: ObjectID!) {
-              runtimeLogs(projectID: $projectID, serviceID: $serviceID, environmentID: $environmentID) {
-                message
-                timestamp
-              }
-            }
-        """, {"projectID": project_id, "serviceID": service_id, "environmentID": environment_id})
+        data = await gql(Q_GET_RUNTIME_LOGS, {"projectID": project_id, "serviceID": service_id, "environmentID": environment_id})
         if "error" in data:
             return f"❌ {data['error']}"
         logs = data.get("runtimeLogs", [])
@@ -239,15 +225,7 @@ async def get_deployments(service_id: str, environment_id: str, project_id: str)
     查 build 日志前需先调用此工具获取 deployment_id。
     project_id 和 environment_id 从 list_projects 获取。"""
     try:
-        data = await gql("""
-            query Deployments($serviceID: ObjectID!, $environmentID: ObjectID!) {
-              deployments(serviceID: $serviceID, environmentID: $environmentID) {
-                edges {
-                  node { _id status createdAt }
-                }
-              }
-            }
-        """, {"serviceID": service_id, "environmentID": environment_id})
+        data = await gql(Q_GET_DEPLOYMENTS, {"serviceID": service_id, "environmentID": environment_id})
         if "error" in data:
             return f"❌ {data['error']}"
         edges = data.get("deployments", {}).get("edges", [])
@@ -271,14 +249,7 @@ async def get_build_logs(deployment_id: str, project_id: str, tail: int = 30, er
     errors_only: 默认True，只返回包含错误关键词的行，大幅减少无用日志。设为False看全部。"""
     try:
         ERROR_KW = {"error", "err!", "failed", "fatal", "exception", "cannot", "not found", "ts2", "ts1", "syntaxerror", "typeerror", "referenceerror"}
-        data = await gql("""
-            query BuildLogs($projectID: ObjectID!, $deploymentID: ObjectID!) {
-              buildLogs(projectID: $projectID, deploymentID: $deploymentID) {
-                message
-                timestamp
-              }
-            }
-        """, {"projectID": project_id, "deploymentID": deployment_id})
+        data = await gql(Q_GET_BUILD_LOGS, {"projectID": project_id, "deploymentID": deployment_id})
         if "error" in data:
             return f"❌ {data['error']}"
         logs = data.get("buildLogs", [])
@@ -306,18 +277,7 @@ async def scan_all_logs() -> str:
     try:
         ERROR_KEYWORDS = {"error", "exception", "traceback", "failed", "critical", "fatal", "crash"}
 
-        data = await gql("""
-            query {
-              projects(skip: 0, limit: 100) {
-                edges {
-                  node {
-                    _id name
-                    environments { _id name }
-                  }
-                }
-              }
-            }
-        """)
+        data = await gql(Q_SCAN_PROJECTS)
         if "error" in data:
             return f"❌ 获取项目失败: {data['error']}"
 
@@ -334,13 +294,7 @@ async def scan_all_logs() -> str:
             return "📭 没有项目或项目下没有环境"
 
         async def get_services(pe):
-            d = await gql("""
-                query($projectID: ObjectID!) {
-                  services(projectID: $projectID) {
-                    edges { node { _id name } }
-                  }
-                }
-            """, {"projectID": pe["project_id"]})
+            d = await gql(Q_SCAN_SERVICES, {"projectID": pe["project_id"]})
             if "error" in d:
                 logger.error("scan_all_logs 获取服务失败 | project=%s error=%s", pe["project_name"], d["error"])
                 return []
@@ -365,13 +319,7 @@ async def scan_all_logs() -> str:
             return "📭 没有服务"
 
         async def scan_service(service):
-            d = await gql("""
-                query($projectID: ObjectID!, $serviceID: ObjectID!, $environmentID: ObjectID!) {
-                  runtimeLogs(projectID: $projectID, serviceID: $serviceID, environmentID: $environmentID) {
-                    message timestamp
-                  }
-                }
-            """, {"projectID": service["project_id"], "serviceID": service["id"], "environmentID": service["env_id"]})
+            d = await gql(Q_SCAN_RUNTIME_LOGS, {"projectID": service["project_id"], "serviceID": service["id"], "environmentID": service["env_id"]})
             if "error" in d:
                 logger.error("scan_all_logs 获取日志失败 | service=%s error=%s", service["name"], d["error"])
                 return service, [f"  ⚠️ 获取该服务日志失败: {d['error']}"]
@@ -415,6 +363,79 @@ async def scan_all_logs() -> str:
         return "\n".join(lines)
     except Exception as e:
         return _err("scan_all_logs", e)
+
+
+@mcp.tool()
+async def get_service(service_id: str) -> str:
+    """获取指定服务的详情（状态与域名）。
+    service_id 从 list_services 获取。"""
+    try:
+        data = await gql(Q_GET_SERVICE, {"id": service_id})
+        if "error" in data:
+            return f"❌ {data['error']}"
+        service = data.get("service")
+        if not service:
+            return "📭 找不到该服务"
+        lines = [
+            f"🔧 {service.get('name')}  service_id: {service.get('_id')}",
+            f"   状态: {service.get('status')}",
+        ]
+        domains = service.get("domains") or []
+        if not domains:
+            lines.append("   🌐 没有绑定域名")
+        else:
+            for domain in domains:
+                lines.append(
+                    f"   🌐 {domain.get('domain')}  status: {domain.get('status')}"
+                )
+        return "\n".join(lines)
+    except Exception as e:
+        return _err("get_service", e, service_id=service_id)
+
+
+@mcp.tool()
+async def list_regions() -> str:
+    """列出当前账号可用的 Zeabur 服务器（官方 list-regions 实际查询 servers，不是共享 region 列表）。"""
+    try:
+        data = await gql(Q_LIST_REGIONS)
+        if "error" in data:
+            return f"❌ {data['error']}"
+        servers = data.get("servers") or []
+        if not servers:
+            return "📭 没有服务器"
+        lines = ["🖥️  服务器列表（list-regions → GraphQL servers）"]
+        for server in servers:
+            status = server.get("status") or {}
+            online = "online" if status.get("isOnline") else "offline"
+            loc = ", ".join(
+                part for part in (server.get("city"), server.get("country")) if part
+            )
+            line = f"🖥️  {server.get('name')}  server_id: {server.get('_id')}  {online}"
+            if loc:
+                line += f"  ({loc})"
+            lines.append(line)
+        return "\n".join(lines)
+    except Exception as e:
+        return _err("list_regions", e)
+
+
+@mcp.tool()
+async def get_me() -> str:
+    """获取当前配置的 Zeabur 账号信息（id / username / email）。"""
+    try:
+        data = await gql(Q_GET_ME)
+        if "error" in data:
+            return f"❌ {data['error']}"
+        me = data.get("me")
+        if not me:
+            return "📭 无法读取当前账号"
+        return (
+            f"👤 {me.get('username')}\n"
+            f"   user_id: {me.get('_id')}\n"
+            f"   email: {me.get('email')}"
+        )
+    except Exception as e:
+        return _err("get_me", e)
 
 
 # ── FastAPI + 传输层 ──────────────────────────────────────────────────────
