@@ -1,16 +1,14 @@
-"""OAuth 2.1 (PKCE) 授权服务器逻辑 —— 持久化存储在 Supabase「晏安的数据库」
-(project ref: segsimuoukrovxrgbjfw)，表名 mcp_oauth_store，service='zeabur-mcp'。
-
-与 sue1231511/supabase 仓库共用同一张表：service 字段区分归属服务，
+"""OAuth 2.1 (PKCE) 授权服务器逻辑 —— OAuth 状态持久化存储在 Supabase。
+表名 mcp_oauth_store，service='zeabur-mcp'；service 字段区分归属服务，
 record_type 字段区分记录种类 (client / auth_code / access_token / refresh_token)。
 
 原内存态实现 (client/auth_code/token 全部存 Python 进程内存的 dict) 在 Zeabur
-每次重新部署或容器重启后会被清空，导致 Claude 端缓存的旧 access_token 全部失效、
-鉴权返回 401——这是本次改造要修的问题，详见 2026-07-02 的排查记录。
+每次重新部署或容器重启后会被清空，导致客户端缓存的旧 access_token 全部失效、
+鉴权返回 401，因此改为持久化存储。
 
-安全说明：这张表已开启 RLS 且未配置任何 policy，只有 service_role key 能穿透
-RLS 访问，anon/publishable key 完全读不到，因此这里必须用 service_role key
-（OAUTH_STORE_SUPABASE_SERVICE_ROLE_KEY），不能用 anon key。
+安全说明：OAuth 存储应启用 RLS，且仅由 service_role key 访问；
+anon/publishable key 不应具备读取权限。这里通过环境变量
+OAUTH_STORE_SUPABASE_SERVICE_ROLE_KEY 注入 service_role key，仓库不保存实际凭据。
 """
 import base64
 import hashlib
