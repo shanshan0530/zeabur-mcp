@@ -2,9 +2,10 @@ import os
 import json
 import asyncio
 import logging
+import secrets
 import traceback
 import httpx
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse, RedirectResponse
@@ -39,6 +40,11 @@ ZEABUR_TOKEN = os.environ.get("ZEABUR_TOKEN", "").strip()
 # 访问口令：Claude 走完整 OAuth 拿动态 token，其他客户端直接把这个原文放进
 # Authorization: Bearer 头。留空则不校验（向后兼容，但等于服务完全公开）。
 MCP_PROXY_SECRET = os.environ.get("MCP_PROXY_SECRET", "").strip()
+# Optional /mcp?token= compatibility fallback for clients that cannot send
+# Authorization headers. Independent of MCP_PROXY_SECRET: empty/unset disables
+# this path entirely (no silent reuse of MCP_PROXY_SECRET). URL credentials may
+# be recorded by proxies; this is intentionally opt-in and independently rotatable.
+MCP_URL_SECRET = os.environ.get("MCP_URL_SECRET", "").strip()
 # 显式指定对外域名，用于生成 OAuth 元数据里的 URL；不设置则从请求头拼（不完全可靠）
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").strip()
 PORT = int(os.environ.get("PORT", 8765))
@@ -491,6 +497,38 @@ async def check_bearer_auth(request: Request) -> bool:
     return await _check_bearer_token(request.headers.get("authorization", ""))
 
 
+def _mcp_query_token_authorized(scope: dict) -> bool:
+    """Narrow /mcp-only URL-token fallback. Does not apply to /sse or OAuth routes.
+
+    Disabled when MCP_URL_SECRET is empty/unset. Never falls back to
+    MCP_PROXY_SECRET. Does not log the secret, the supplied token, or the raw
+    query string.
+    """
+    if not MCP_URL_SECRET:
+        return False
+    path = scope.get("path") or ""
+    if path != "/mcp":
+        return False
+    query_string = scope.get("query_string") or b""
+    try:
+        raw = (
+            query_string.decode("latin-1")
+            if isinstance(query_string, (bytes, bytearray))
+            else str(query_string)
+        )
+        params = parse_qs(raw, keep_blank_values=False)
+    except Exception:
+        return False
+    supplied_values = params.get("token") or []
+    if not supplied_values:
+        return False
+    supplied = supplied_values[0]
+    try:
+        return secrets.compare_digest(supplied, MCP_URL_SECRET)
+    except (TypeError, ValueError):
+        return False
+
+
 async def _parse_body(request: Request) -> dict:
     """兼容 JSON 和 form-urlencoded 两种提交方式（OAuth /token /register 各家客户端实现不完全一致）。"""
     content_type = request.headers.get("content-type", "")
@@ -705,7 +743,10 @@ class MCPAuthGuard:
             return
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
         auth_header = headers.get("authorization", "")
-        if not await _check_bearer_token(auth_header):
+        authorized = await _check_bearer_token(auth_header)
+        if not authorized:
+            authorized = _mcp_query_token_authorized(scope)
+        if not authorized:
             logger.warning("拒绝未授权的 /mcp 请求 | path=%s", scope.get("path"))
             response = JSONResponse(
                 status_code=401,
@@ -751,6 +792,8 @@ if __name__ == "__main__":
     import uvicorn
     if not MCP_PROXY_SECRET:
         logger.warning("MCP_PROXY_SECRET 还没配置，当前 /sse 和 /mcp 对所有人开放，建议尽快配置")
+    if MCP_URL_SECRET:
+        logger.info("MCP_URL_SECRET 已配置，/mcp 支持 ?token= 兼容鉴权（URL 可能被代理记录，请独立轮换）")
     if not PUBLIC_BASE_URL:
         logger.warning("PUBLIC_BASE_URL 没配置，OAuth 元数据会尝试从请求头拼 URL，建议显式配置成 Zeabur 分配的域名")
     if not oauth.SUPABASE_URL or not oauth.SUPABASE_SERVICE_ROLE_KEY:
