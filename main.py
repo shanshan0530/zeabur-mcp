@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlparse
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse, RedirectResponse
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.sse import SseServerTransport
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.routing import Mount
@@ -17,6 +17,9 @@ from starlette.routing import Mount
 import oauth
 from authorize_page import render_authorize_page
 from graphql_ops import (
+    M_CREATE_ENVIRONMENT_VARIABLE,
+    M_REDEPLOY_SERVICE,
+    M_UPDATE_SINGLE_ENVIRONMENT_VARIABLE,
     Q_GET_BUILD_LOGS,
     Q_GET_DEPLOYMENTS,
     Q_GET_ME,
@@ -28,6 +31,7 @@ from graphql_ops import (
     Q_SCAN_PROJECTS,
     Q_SCAN_RUNTIME_LOGS,
     Q_SCAN_SERVICES,
+    Q_SERVICE_VARIABLE_KEYS,
 )
 
 logging.basicConfig(
@@ -45,10 +49,26 @@ MCP_PROXY_SECRET = os.environ.get("MCP_PROXY_SECRET", "").strip()
 # this path entirely (no silent reuse of MCP_PROXY_SECRET). URL credentials may
 # be recorded by proxies; this is intentionally opt-in and independently rotatable.
 MCP_URL_SECRET = os.environ.get("MCP_URL_SECRET", "").strip()
+# Optional /mcp?token= operator credential. Independent of MCP_URL_SECRET and
+# MCP_PROXY_SECRET: empty/unset disables this path; never falls back to another
+# secret. Grants OPERATOR capability only.
+MCP_OPERATOR_URL_SECRET = os.environ.get("MCP_OPERATOR_URL_SECRET", "").strip()
+# Master write gate. Unset / any non-truthy value => write tools refuse before
+# any Zeabur mutation. Operator credentials may still use read-only tools.
+MCP_WRITES_ENABLED = os.environ.get("MCP_WRITES_ENABLED", "").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+# JSON array of exact {service_id, environment_id} pairs. Empty/unset => no
+# write targets. Malformed JSON or entries => fail closed at use time.
+MCP_OPERATOR_POLICY = os.environ.get("MCP_OPERATOR_POLICY", "").strip()
 # 显式指定对外域名，用于生成 OAuth 元数据里的 URL；不设置则从请求头拼（不完全可靠）
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").strip()
 PORT = int(os.environ.get("PORT", 8765))
 GRAPHQL_URL = "https://api.zeabur.com/graphql"
+
+CAPABILITY_READ = "READ"
+CAPABILITY_OPERATOR = "OPERATOR"
+SCOPE_CAPABILITY_KEY = "zeabur_capability"
 
 def _build_transport_security() -> TransportSecuritySettings:
     """从 PUBLIC_BASE_URL 解析出对外域名，加入 DNS 重绑定防护（MCP SDK 自带机制）的
@@ -95,8 +115,43 @@ mcp = FastMCP(
 
 # ── GraphQL Helper ────────────────────────────────────────────────────────────
 
-async def gql(query: str, variables: dict = None) -> dict:
-    """调用 Zeabur GraphQL API。所有网络/解析异常均在此处捕获并记录日志，不会向上抛出。"""
+def _redact_known_secret_value(value):
+    """Replace values that equal configured secrets. Never log the secrets themselves."""
+    if not isinstance(value, str) or not value:
+        return value
+    for secret in (
+        ZEABUR_TOKEN,
+        MCP_PROXY_SECRET,
+        MCP_URL_SECRET,
+        MCP_OPERATOR_URL_SECRET,
+    ):
+        if secret and value == secret:
+            return "[REDACTED]"
+    return value
+
+
+def _safe_gql_variables(variables: dict | None, redact_keys: set | frozenset | None = None) -> dict | None:
+    """Copy GraphQL variables for logging. Read-only calls keep keys/values;
+    callers that pass secret env values must supply redact_keys (e.g. {'value'}).
+    """
+    if not variables:
+        return variables
+    redact = set(redact_keys or ())
+    safe = {}
+    for key, value in variables.items():
+        if key in redact:
+            safe[key] = "[REDACTED]"
+        else:
+            safe[key] = _redact_known_secret_value(value)
+    return safe
+
+
+async def gql(query: str, variables: dict = None, *, redact_keys: set | frozenset | None = None) -> dict:
+    """调用 Zeabur GraphQL API。所有网络/解析异常均在此处捕获并记录日志，不会向上抛出。
+
+    redact_keys: variable names whose values must never appear in logs (env writes).
+    Authorization headers and ZEABUR_TOKEN are never logged.
+    """
     if not ZEABUR_TOKEN:
         logger.error("gql 调用失败: ZEABUR_TOKEN 未设置")
         return {"error": "ZEABUR_TOKEN 未设置"}
@@ -109,24 +164,27 @@ async def gql(query: str, variables: dict = None) -> dict:
     if variables:
         body["variables"] = variables
 
+    log_vars = _safe_gql_variables(variables, redact_keys)
+    redact_body = bool(redact_keys)
+
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(GRAPHQL_URL, json=body, headers=headers)
     except httpx.TimeoutException:
         logger.error(
-            "gql 请求超时 | variables=%s\n%s", variables, traceback.format_exc()
+            "gql 请求超时 | variables=%s\n%s", log_vars, traceback.format_exc()
         )
         return {"error": "请求 Zeabur API 超时（30s），请稍后重试"}
     except httpx.RequestError as e:
         logger.error(
             "gql 网络请求异常: %s | variables=%s\n%s",
-            e, variables, traceback.format_exc()
+            e, log_vars, traceback.format_exc()
         )
         return {"error": f"网络请求失败: {e}"}
     except Exception as e:
         logger.error(
             "gql 请求发生未预期异常: %s | variables=%s\n%s",
-            e, variables, traceback.format_exc()
+            e, log_vars, traceback.format_exc()
         )
         return {"error": f"请求异常: {e}"}
 
@@ -135,20 +193,22 @@ async def gql(query: str, variables: dict = None) -> dict:
     except (ValueError, json.JSONDecodeError):
         logger.error(
             "gql 响应非 JSON | status=%s body=%s\n%s",
-            resp.status_code, resp.text[:500], traceback.format_exc()
+            resp.status_code,
+            "[REDACTED]" if redact_body else resp.text[:500],
+            traceback.format_exc(),
         )
         return {"error": f"Zeabur API 返回了非 JSON 响应 (HTTP {resp.status_code})"}
 
     if resp.status_code >= 400:
         logger.error(
             "gql HTTP 错误 status=%s | variables=%s | body=%s",
-            resp.status_code, variables, data
+            resp.status_code, log_vars, "[REDACTED]" if redact_body else data
         )
         return {"error": data.get("errors") or f"HTTP {resp.status_code}: {data}"}
 
     if "errors" in data:
         logger.error(
-            "gql GraphQL 错误 | variables=%s | errors=%s", variables, data["errors"]
+            "gql GraphQL 错误 | variables=%s | errors=%s", log_vars, data["errors"]
         )
         return {"error": data["errors"]}
 
@@ -159,6 +219,86 @@ def _err(prefix: str, e: Exception, **ctx) -> str:
     """统一的工具层异常处理：记录堆栈+关键变量，返回给用户的友好提示。"""
     logger.error("%s 异常: %s | ctx=%s\n%s", prefix, e, ctx, traceback.format_exc())
     return f"❌ {prefix} 处理出错，已记录日志: {e}"
+
+
+def parse_operator_policy(raw: str | None) -> frozenset[tuple[str, str]] | None:
+    """Parse MCP_OPERATOR_POLICY into exact-match (service_id, environment_id) tuples.
+
+    Empty/unset => empty frozenset (no write targets).
+    Malformed JSON or malformed entries => None (fail closed).
+    No wildcards, no prefix matching, no project_id requirement.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return frozenset()
+    try:
+        data = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, list):
+        return None
+    targets: list[tuple[str, str]] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            return None
+        service_id = entry.get("service_id")
+        environment_id = entry.get("environment_id")
+        if not isinstance(service_id, str) or not isinstance(environment_id, str):
+            return None
+        if not service_id.strip() or not environment_id.strip():
+            return None
+        targets.append((service_id, environment_id))
+    return frozenset(targets)
+
+
+def _authorized_write_targets() -> frozenset[tuple[str, str]] | None:
+    return parse_operator_policy(MCP_OPERATOR_POLICY)
+
+
+def _target_authorized(service_id: str, environment_id: str) -> bool:
+    targets = _authorized_write_targets()
+    if targets is None:
+        return False
+    return (service_id, environment_id) in targets
+
+
+def _capability_from_ctx(ctx) -> str | None:
+    """Read request-scoped capability. Missing request/context/state => fail closed."""
+    if ctx is None:
+        return None
+    try:
+        request_context = ctx.request_context
+        request = getattr(request_context, "request", None)
+        if request is None:
+            return None
+        scope = getattr(request, "scope", None)
+        if not isinstance(scope, dict):
+            return None
+        state = scope.get("state")
+        if not isinstance(state, dict):
+            return None
+        cap = state.get(SCOPE_CAPABILITY_KEY)
+        if cap in (CAPABILITY_READ, CAPABILITY_OPERATOR):
+            return cap
+        return None
+    except Exception:
+        return None
+
+
+def _write_preflight(ctx, service_id: str, environment_id: str) -> str | None:
+    """Shared write gates. Returns a refusal string, or None if the mutation may proceed
+    past capability / master-gate / target-policy checks.
+    """
+    if _capability_from_ctx(ctx) != CAPABILITY_OPERATOR:
+        return "❌ OPERATOR capability required; write refused"
+    if not MCP_WRITES_ENABLED:
+        return "❌ Writes are disabled (MCP_WRITES_ENABLED); write refused"
+    targets = _authorized_write_targets()
+    if targets is None:
+        return "❌ Operator policy is invalid; write refused"
+    if (service_id, environment_id) not in targets:
+        return "❌ Target is not authorized by MCP_OPERATOR_POLICY; write refused"
+    return None
 
 
 # ── MCP 工具 ───────────────────────────────────────────────────────────
@@ -444,6 +584,152 @@ async def get_me() -> str:
         return _err("get_me", e)
 
 
+@mcp.tool()
+async def redeploy_service(
+    service_id: str,
+    environment_id: str,
+    confirm: bool = False,
+    ctx: Context | None = None,
+) -> str:
+    """Redeploy an authorized Zeabur service in one environment.
+
+    This is redeploy, not restart, and not "deploy latest main".
+    Requires OPERATOR capability, MCP_WRITES_ENABLED, an exact policy match,
+    and confirm=true. confirm=false performs zero network calls.
+    """
+    try:
+        refusal = _write_preflight(ctx, service_id, environment_id)
+        if refusal:
+            return refusal
+        if not confirm:
+            return (
+                f"Dry-run: would redeploy service_id={service_id} "
+                f"environment_id={environment_id}. Set confirm=true to execute. "
+                "No network call was made."
+            )
+        data = await gql(
+            M_REDEPLOY_SERVICE,
+            {"serviceID": service_id, "environmentID": environment_id},
+        )
+        if "error" in data:
+            return f"❌ Redeploy failed for service_id={service_id} environment_id={environment_id}: {data['error']}"
+        ok = data.get("redeployService")
+        if ok is True:
+            return (
+                f"Redeploy accepted: service_id={service_id} "
+                f"environment_id={environment_id} status=success"
+            )
+        return (
+            f"❌ Redeploy did not succeed for service_id={service_id} "
+            f"environment_id={environment_id} status={ok!r}"
+        )
+    except Exception as e:
+        return _err("redeploy_service", e, service_id=service_id, environment_id=environment_id)
+
+
+def _variable_keys_from_lookup(data: dict) -> set[str] | None:
+    if "error" in data:
+        return None
+    service = data.get("service")
+    if not isinstance(service, dict):
+        return set()
+    variables = service.get("variables") or []
+    if not isinstance(variables, list):
+        return set()
+    keys = set()
+    for item in variables:
+        if isinstance(item, dict) and isinstance(item.get("key"), str) and item["key"]:
+            keys.add(item["key"])
+    return keys
+
+
+@mcp.tool()
+async def set_service_env_var(
+    service_id: str,
+    environment_id: str,
+    key: str,
+    value: str,
+    confirm: bool = False,
+    ctx: Context | None = None,
+) -> str:
+    """Create or update one environment variable on an authorized service/environment.
+
+    Looks up KEYS only (never current values). confirm=false reports would-create
+    or would-update and performs no mutation. Does not redeploy afterwards.
+    The supplied value is never returned or logged.
+    """
+    try:
+        refusal = _write_preflight(ctx, service_id, environment_id)
+        if refusal:
+            return refusal
+        lookup = await gql(
+            Q_SERVICE_VARIABLE_KEYS,
+            {"serviceID": service_id, "environmentID": environment_id},
+        )
+        keys = _variable_keys_from_lookup(lookup)
+        if keys is None:
+            return (
+                f"❌ Env key lookup failed for service_id={service_id} "
+                f"environment_id={environment_id} key={key}: {lookup.get('error')}"
+            )
+        exists = key in keys
+        if not confirm:
+            action = "would update" if exists else "would create"
+            return (
+                f"Dry-run: {action} key={key} on service_id={service_id} "
+                f"environment_id={environment_id}. Set confirm=true to execute. "
+                "No mutation was made."
+            )
+        if not exists:
+            result = await gql(
+                M_CREATE_ENVIRONMENT_VARIABLE,
+                {
+                    "serviceID": service_id,
+                    "environmentID": environment_id,
+                    "key": key,
+                    "value": value,
+                },
+                redact_keys={"value"},
+            )
+            if "error" in result:
+                return (
+                    f"❌ Create env var failed for service_id={service_id} "
+                    f"environment_id={environment_id} key={key}: {result['error']}"
+                )
+            return (
+                f"Env var created: service_id={service_id} "
+                f"environment_id={environment_id} key={key} status=success"
+            )
+        result = await gql(
+            M_UPDATE_SINGLE_ENVIRONMENT_VARIABLE,
+            {
+                "serviceID": service_id,
+                "environmentID": environment_id,
+                "oldKey": key,
+                "newKey": key,
+                "value": value,
+            },
+            redact_keys={"value"},
+        )
+        if "error" in result:
+            return (
+                f"❌ Update env var failed for service_id={service_id} "
+                f"environment_id={environment_id} key={key}: {result['error']}"
+            )
+        return (
+            f"Env var updated: service_id={service_id} "
+            f"environment_id={environment_id} key={key} status=success"
+        )
+    except Exception as e:
+        return _err(
+            "set_service_env_var",
+            e,
+            service_id=service_id,
+            environment_id=environment_id,
+            key=key,
+        )
+
+
 # ── FastAPI + 传输层 ──────────────────────────────────────────────────────
 
 # 关键：mcp.streamable_http_app() 要求 FastAPI 的 lifespan 运行 mcp.session_manager.run()，
@@ -509,6 +795,36 @@ def _mcp_query_token_authorized(scope: dict) -> bool:
     path = scope.get("path") or ""
     if path != "/mcp":
         return False
+    supplied = _mcp_query_token(scope)
+    if supplied is None:
+        return False
+    try:
+        return secrets.compare_digest(supplied, MCP_URL_SECRET)
+    except (TypeError, ValueError):
+        return False
+
+
+def _mcp_operator_query_token_authorized(scope: dict) -> bool:
+    """Independent /mcp-only operator URL-token. Never falls back to another secret.
+
+    Disabled when MCP_OPERATOR_URL_SECRET is empty/unset. Does not log the secret,
+    the supplied token, or the raw query string.
+    """
+    if not MCP_OPERATOR_URL_SECRET:
+        return False
+    path = scope.get("path") or ""
+    if path != "/mcp":
+        return False
+    supplied = _mcp_query_token(scope)
+    if supplied is None:
+        return False
+    try:
+        return secrets.compare_digest(supplied, MCP_OPERATOR_URL_SECRET)
+    except (TypeError, ValueError):
+        return False
+
+
+def _mcp_query_token(scope: dict) -> str | None:
     query_string = scope.get("query_string") or b""
     try:
         raw = (
@@ -518,15 +834,50 @@ def _mcp_query_token_authorized(scope: dict) -> bool:
         )
         params = parse_qs(raw, keep_blank_values=False)
     except Exception:
-        return False
+        return None
     supplied_values = params.get("token") or []
     if not supplied_values:
-        return False
-    supplied = supplied_values[0]
-    try:
-        return secrets.compare_digest(supplied, MCP_URL_SECRET)
-    except (TypeError, ValueError):
-        return False
+        return None
+    return supplied_values[0]
+
+
+def _bearer_token(auth_header: str) -> str | None:
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header[7:].strip()
+        return token or None
+    return None
+
+
+async def _resolve_request_capability(scope: dict, auth_header: str) -> str | None:
+    """Map the current ASGI request to READ / OPERATOR, or None if unauthorized.
+
+    Classification:
+    - MCP_PROXY_SECRET Bearer => OPERATOR
+    - MCP_OPERATOR_URL_SECRET /mcp?token= => OPERATOR
+    - MCP_URL_SECRET /mcp?token= => READ
+    - valid OAuth access token => READ
+    - MCP_PROXY_SECRET unset (open mode) => READ (writes still fail closed)
+    - invalid/no credential => None
+    """
+    bearer = _bearer_token(auth_header)
+
+    if MCP_PROXY_SECRET and bearer and bearer == MCP_PROXY_SECRET:
+        return CAPABILITY_OPERATOR
+
+    if _mcp_operator_query_token_authorized(scope):
+        return CAPABILITY_OPERATOR
+
+    if _mcp_query_token_authorized(scope):
+        return CAPABILITY_READ
+
+    if bearer and await oauth.is_access_token_valid(bearer):
+        return CAPABILITY_READ
+
+    if not MCP_PROXY_SECRET:
+        logger.warning("MCP_PROXY_SECRET 未配置，当前处于无鉴权状态，任何人拿到 URL 都能操作你的 Zeabur")
+        return CAPABILITY_READ
+
+    return None
 
 
 async def _parse_body(request: Request) -> dict:
@@ -743,10 +1094,8 @@ class MCPAuthGuard:
             return
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
         auth_header = headers.get("authorization", "")
-        authorized = await _check_bearer_token(auth_header)
-        if not authorized:
-            authorized = _mcp_query_token_authorized(scope)
-        if not authorized:
+        capability = await _resolve_request_capability(scope, auth_header)
+        if capability is None:
             logger.warning("拒绝未授权的 /mcp 请求 | path=%s", scope.get("path"))
             response = JSONResponse(
                 status_code=401,
@@ -761,6 +1110,23 @@ class MCPAuthGuard:
             )
             await response(scope, receive, send)
             return
+        state = scope.setdefault("state", {})
+        if not isinstance(state, dict):
+            logger.warning("拒绝 /mcp 请求：scope.state 不可写 | path=%s", scope.get("path"))
+            response = JSONResponse(
+                status_code=401,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {
+                        "code": -32001,
+                        "message": "鉴权失败：请在请求头带 Authorization: Bearer <你的密钥>，或通过 OAuth 授权流程获取令牌。",
+                    },
+                    "id": None,
+                },
+            )
+            await response(scope, receive, send)
+            return
+        state[SCOPE_CAPABILITY_KEY] = capability
         try:
             await self.asgi_app(scope, receive, send)
         except Exception as e:
@@ -794,6 +1160,12 @@ if __name__ == "__main__":
         logger.warning("MCP_PROXY_SECRET 还没配置，当前 /sse 和 /mcp 对所有人开放，建议尽快配置")
     if MCP_URL_SECRET:
         logger.info("MCP_URL_SECRET 已配置，/mcp 支持 ?token= 兼容鉴权（URL 可能被代理记录，请独立轮换）")
+    if MCP_OPERATOR_URL_SECRET:
+        logger.info("MCP_OPERATOR_URL_SECRET 已配置，/mcp 支持独立 operator ?token= 鉴权")
+    if MCP_WRITES_ENABLED:
+        logger.info("MCP_WRITES_ENABLED 已开启，write tools 仍受 OPERATOR 与目标策略约束")
+    else:
+        logger.info("MCP_WRITES_ENABLED 未开启，write tools 拒绝任何变更")
     if not PUBLIC_BASE_URL:
         logger.warning("PUBLIC_BASE_URL 没配置，OAuth 元数据会尝试从请求头拼 URL，建议显式配置成 Zeabur 分配的域名")
     if not oauth.SUPABASE_URL or not oauth.SUPABASE_SERVICE_ROLE_KEY:
