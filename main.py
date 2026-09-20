@@ -200,13 +200,25 @@ async def gql(query: str, variables: dict = None, *, redact_keys: set | frozense
         return {"error": f"Zeabur API 返回了非 JSON 响应 (HTTP {resp.status_code})"}
 
     if resp.status_code >= 400:
+        if redact_body:
+            logger.error(
+                "gql HTTP 错误 status=%s | variables=%s | body=[REDACTED]",
+                resp.status_code, log_vars,
+            )
+            return {"error": f"HTTP {resp.status_code}"}
         logger.error(
             "gql HTTP 错误 status=%s | variables=%s | body=%s",
-            resp.status_code, log_vars, "[REDACTED]" if redact_body else data
+            resp.status_code, log_vars, data
         )
         return {"error": data.get("errors") or f"HTTP {resp.status_code}: {data}"}
 
     if "errors" in data:
+        if redact_body:
+            logger.error(
+                "gql GraphQL 错误 | variables=%s | errors=[REDACTED]",
+                log_vars,
+            )
+            return {"error": "GraphQL error"}
         logger.error(
             "gql GraphQL 错误 | variables=%s | errors=%s", log_vars, data["errors"]
         )
@@ -588,8 +600,8 @@ async def get_me() -> str:
 async def redeploy_service(
     service_id: str,
     environment_id: str,
+    ctx: Context,
     confirm: bool = False,
-    ctx: Context | None = None,
 ) -> str:
     """Redeploy an authorized Zeabur service in one environment.
 
@@ -628,18 +640,30 @@ async def redeploy_service(
 
 
 def _variable_keys_from_lookup(data: dict) -> set[str] | None:
+    """Return env-var keys, or None on lookup failure.
+
+    valid service + valid variables list => set of keys
+    explicit empty variables list => empty set
+    missing/null/malformed service or variables => None (do not treat as absent)
+    """
     if "error" in data:
         return None
     service = data.get("service")
     if not isinstance(service, dict):
-        return set()
-    variables = service.get("variables") or []
+        return None
+    if "variables" not in service:
+        return None
+    variables = service["variables"]
     if not isinstance(variables, list):
-        return set()
+        return None
     keys = set()
     for item in variables:
-        if isinstance(item, dict) and isinstance(item.get("key"), str) and item["key"]:
-            keys.add(item["key"])
+        if not isinstance(item, dict):
+            return None
+        key = item.get("key")
+        if not isinstance(key, str) or not key:
+            return None
+        keys.add(key)
     return keys
 
 
@@ -649,8 +673,8 @@ async def set_service_env_var(
     environment_id: str,
     key: str,
     value: str,
+    ctx: Context,
     confirm: bool = False,
-    ctx: Context | None = None,
 ) -> str:
     """Create or update one environment variable on an authorized service/environment.
 

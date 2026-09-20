@@ -183,7 +183,11 @@ M_CREATE_ENVIRONMENT_VARIABLE = """
                 environmentID: $environmentID,
                 key: $key,
                 value: $value
-              )
+              ) {
+                key
+                exposed
+                readonly
+              }
             }
         """
 
@@ -201,7 +205,11 @@ M_UPDATE_SINGLE_ENVIRONMENT_VARIABLE = """
                 oldKey: $oldKey,
                 newKey: $newKey,
                 value: $value
-              )
+              ) {
+                key
+                exposed
+                readonly
+              }
             }
         """
 

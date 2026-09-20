@@ -9,10 +9,12 @@ import logging
 import re
 from pathlib import Path
 from types import SimpleNamespace
+from typing import get_origin
 from unittest.mock import patch
 
 import pytest
 from fastapi.responses import JSONResponse
+from mcp.server.fastmcp import Context
 from starlette.requests import Request
 
 import graphql_ops
@@ -145,8 +147,31 @@ def test_exactly_two_new_write_tools_and_inventory_is_eleven():
     tools = {t.name: t for t in asyncio.run(main.mcp.list_tools())}
     for write_name in WRITE_TWO:
         schema = tools[write_name].inputSchema
-        assert "ctx" not in schema.get("properties", {})
+        props = schema.get("properties", {})
+        assert "ctx" not in props
+        assert "context" not in {k.lower() for k in props}
         assert "Context" not in json.dumps(schema)
+        assert "confirm" in props
+
+
+def test_write_tool_public_schema_hides_context_and_keeps_confirm():
+    tools = {t.name: t for t in asyncio.run(main.mcp.list_tools())}
+    redeploy = tools["redeploy_service"].inputSchema["properties"]
+    assert set(redeploy) == {"service_id", "environment_id", "confirm"}
+    assert redeploy["confirm"]["type"] == "boolean"
+    assert redeploy["confirm"]["default"] is False
+    env = tools["set_service_env_var"].inputSchema["properties"]
+    assert set(env) == {"service_id", "environment_id", "key", "value", "confirm"}
+    assert env["confirm"]["type"] == "boolean"
+    assert env["confirm"]["default"] is False
+
+    for fn in (main.redeploy_service, main.set_service_env_var):
+        sig = inspect.signature(fn)
+        ctx_ann = sig.parameters["ctx"].annotation
+        assert ctx_ann is Context
+        assert get_origin(ctx_ann) is None
+        names = list(sig.parameters)
+        assert names.index("ctx") < names.index("confirm")
 
 
 def test_graphql_documents_remain_query_only():
@@ -176,6 +201,20 @@ def test_write_registry_contains_only_approved_mutations():
     assert "deployFromSpecification" not in joined
     assert "updateEnvironmentVariable(" not in joined
     assert "deleteEnvironmentVariable" not in joined
+    create = MUTATION_DOCUMENTS["create_environment_variable"]
+    update = MUTATION_DOCUMENTS["update_single_environment_variable"]
+    redeploy = MUTATION_DOCUMENTS["redeploy_service"]
+    for document in (create, update):
+        selected = re.search(
+            r"(?:createEnvironmentVariable|updateSingleEnvironmentVariable)\s*\([^)]*\)\s*\{([^}]+)\}",
+            document,
+            re.S,
+        )
+        assert selected, document
+        fields = {part.strip() for part in selected.group(1).splitlines() if part.strip()}
+        assert fields == {"key", "exposed", "readonly"}
+        assert "value" not in fields
+    assert not re.search(r"redeployService\s*\([^)]*\)\s*\{", redeploy)
 
 
 def test_no_inline_mutation_strings_in_main():
@@ -268,9 +307,9 @@ def test_operator_url_token_is_mcp_only_and_independent(monkeypatch):
 def test_read_cannot_execute_write_tools(monkeypatch):
     enable_writes(monkeypatch)
     posted = _record_gql(monkeypatch)
-    redeploy = asyncio.run(main.redeploy_service(SVC, ENV, True, ctx=read_ctx()))
+    redeploy = asyncio.run(main.redeploy_service(SVC, ENV, read_ctx(), True))
     env_set = asyncio.run(
-        main.set_service_env_var(SVC, ENV, "K", ENV_SECRET_VALUE, True, ctx=read_ctx())
+        main.set_service_env_var(SVC, ENV, "K", ENV_SECRET_VALUE, read_ctx(), True)
     )
     assert redeploy.startswith("❌")
     assert "OPERATOR" in redeploy
@@ -347,12 +386,12 @@ def test_writes_disabled_by_default_zero_mutation(monkeypatch):
     assert main.MCP_WRITES_ENABLED is False
     monkeypatch.setattr(main, "MCP_OPERATOR_POLICY", POLICY_JSON)
     posted = _record_gql(monkeypatch)
-    r1 = asyncio.run(main.redeploy_service(SVC, ENV, True, ctx=operator_ctx()))
+    r1 = asyncio.run(main.redeploy_service(SVC, ENV, operator_ctx(), True))
     r2 = asyncio.run(
-        main.set_service_env_var(SVC, ENV, "K", ENV_SECRET_VALUE, True, ctx=operator_ctx())
+        main.set_service_env_var(SVC, ENV, "K", ENV_SECRET_VALUE, operator_ctx(), True)
     )
     r3 = asyncio.run(
-        main.set_service_env_var(SVC, ENV, "K", ENV_SECRET_VALUE, False, ctx=operator_ctx())
+        main.set_service_env_var(SVC, ENV, "K", ENV_SECRET_VALUE, operator_ctx(), False)
     )
     assert "disabled" in r1.lower() or "MCP_WRITES_ENABLED" in r1
     assert "disabled" in r2.lower() or "MCP_WRITES_ENABLED" in r2
@@ -380,11 +419,11 @@ def test_empty_or_malformed_policy_fail_closed(monkeypatch, raw):
     monkeypatch.setattr(main, "MCP_WRITES_ENABLED", True)
     monkeypatch.setattr(main, "MCP_OPERATOR_POLICY", raw)
     posted = _record_gql(monkeypatch)
-    result = asyncio.run(main.redeploy_service(SVC, ENV, True, ctx=operator_ctx()))
+    result = asyncio.run(main.redeploy_service(SVC, ENV, operator_ctx(), True))
     assert result.startswith("❌")
     assert posted == []
     env_result = asyncio.run(
-        main.set_service_env_var(SVC, ENV, "K", ENV_SECRET_VALUE, True, ctx=operator_ctx())
+        main.set_service_env_var(SVC, ENV, "K", ENV_SECRET_VALUE, operator_ctx(), True)
     )
     assert env_result.startswith("❌")
     assert posted == []
@@ -397,7 +436,7 @@ def test_wildcard_policy_does_not_prefix_match(monkeypatch):
         json.dumps([{"service_id": "*", "environment_id": "*"}]),
     )
     posted = _record_gql(monkeypatch)
-    result = asyncio.run(main.redeploy_service(SVC, ENV, True, ctx=operator_ctx()))
+    result = asyncio.run(main.redeploy_service(SVC, ENV, operator_ctx(), True))
     assert result.startswith("❌")
     assert posted == []
 
@@ -408,11 +447,11 @@ def test_target_mismatch_zero_mutation(monkeypatch):
         json.dumps([{"service_id": "other-svc", "environment_id": ENV}]),
     )
     posted = _record_gql(monkeypatch)
-    result = asyncio.run(main.redeploy_service(SVC, ENV, True, ctx=operator_ctx()))
+    result = asyncio.run(main.redeploy_service(SVC, ENV, operator_ctx(), True))
     assert "not authorized" in result.lower() or "policy" in result.lower()
     assert posted == []
     env_result = asyncio.run(
-        main.set_service_env_var(SVC, ENV, "K", ENV_SECRET_VALUE, False, ctx=operator_ctx())
+        main.set_service_env_var(SVC, ENV, "K", ENV_SECRET_VALUE, operator_ctx(), False)
     )
     assert env_result.startswith("❌")
     assert posted == []
@@ -421,7 +460,7 @@ def test_target_mismatch_zero_mutation(monkeypatch):
 def test_confirm_false_redeploy_zero_network(monkeypatch):
     enable_writes(monkeypatch)
     posted = _record_gql(monkeypatch)
-    result = asyncio.run(main.redeploy_service(SVC, ENV, False, ctx=operator_ctx()))
+    result = asyncio.run(main.redeploy_service(SVC, ENV, operator_ctx(), False))
     assert "Dry-run" in result
     assert "latest main" not in result.lower()
     assert posted == []
@@ -434,7 +473,7 @@ def test_confirmed_redeploy_exactly_one_mocked_mutation(monkeypatch):
         return {"redeployService": True}
 
     posted = _record_gql(monkeypatch, handler)
-    result = asyncio.run(main.redeploy_service(SVC, ENV, True, ctx=operator_ctx()))
+    result = asyncio.run(main.redeploy_service(SVC, ENV, operator_ctx(), True))
     assert "status=success" in result
     assert SVC in result and ENV in result
     assert "latest main" not in result.lower()
@@ -453,10 +492,10 @@ def test_env_dry_run_key_only_read_zero_mutation(monkeypatch):
 
     posted = _record_gql(monkeypatch, handler)
     create_msg = asyncio.run(
-        main.set_service_env_var(SVC, ENV, "NEW", ENV_SECRET_VALUE, False, ctx=operator_ctx())
+        main.set_service_env_var(SVC, ENV, "NEW", ENV_SECRET_VALUE, operator_ctx(), False)
     )
     update_msg = asyncio.run(
-        main.set_service_env_var(SVC, ENV, "EXISTING", ENV_SECRET_VALUE, False, ctx=operator_ctx())
+        main.set_service_env_var(SVC, ENV, "EXISTING", ENV_SECRET_VALUE, operator_ctx(), False)
     )
     assert "would create" in create_msg
     assert "would update" in update_msg
@@ -484,7 +523,7 @@ def test_env_create_path_key_lookup_plus_one_create(monkeypatch):
 
     posted = _record_gql(monkeypatch, handler)
     result = asyncio.run(
-        main.set_service_env_var(SVC, ENV, "NEW_KEY", ENV_SECRET_VALUE, True, ctx=operator_ctx())
+        main.set_service_env_var(SVC, ENV, "NEW_KEY", ENV_SECRET_VALUE, operator_ctx(), True)
     )
     assert "created" in result.lower()
     assert ENV_SECRET_VALUE not in result
@@ -508,7 +547,7 @@ def test_env_update_path_key_lookup_plus_one_update_single(monkeypatch):
 
     posted = _record_gql(monkeypatch, handler)
     result = asyncio.run(
-        main.set_service_env_var(SVC, ENV, "EXISTING", ENV_SECRET_VALUE, True, ctx=operator_ctx())
+        main.set_service_env_var(SVC, ENV, "EXISTING", ENV_SECRET_VALUE, operator_ctx(), True)
     )
     assert "updated" in result.lower()
     assert ENV_SECRET_VALUE not in result
@@ -536,10 +575,10 @@ def test_write_error_fails_without_fallback_or_retry(monkeypatch):
         raise AssertionError(f"unexpected extra call: {query}")
 
     posted = _record_gql(monkeypatch, handler)
-    redeploy = asyncio.run(main.redeploy_service(SVC, ENV, True, ctx=operator_ctx()))
+    redeploy = asyncio.run(main.redeploy_service(SVC, ENV, operator_ctx(), True))
     assert "boom-redeploy" in redeploy
     env_set = asyncio.run(
-        main.set_service_env_var(SVC, ENV, "NEW", ENV_SECRET_VALUE, True, ctx=operator_ctx())
+        main.set_service_env_var(SVC, ENV, "NEW", ENV_SECRET_VALUE, operator_ctx(), True)
     )
     assert "boom-create" in env_set
     assert ENV_SECRET_VALUE not in env_set
@@ -578,7 +617,7 @@ def test_env_value_and_auth_secrets_are_not_logged(monkeypatch, caplog):
         with _patch_client(handler):
             result = asyncio.run(
                 main.set_service_env_var(
-                    SVC, ENV, "SECRET_KEY", ENV_SECRET_VALUE, True, ctx=operator_ctx()
+                    SVC, ENV, "SECRET_KEY", ENV_SECRET_VALUE, operator_ctx(), True
                 )
             )
         _guard_capability(query_string=f"token={TEST_URL_SECRET}")
@@ -601,7 +640,7 @@ def test_env_value_and_auth_secrets_are_not_logged(monkeypatch, caplog):
 def test_missing_context_fails_closed(monkeypatch):
     enable_writes(monkeypatch)
     posted = _record_gql(monkeypatch)
-    result = asyncio.run(main.redeploy_service(SVC, ENV, True, ctx=None))
+    result = asyncio.run(main.redeploy_service(SVC, ENV, None, True))
     assert result.startswith("❌")
     assert posted == []
 
@@ -610,7 +649,7 @@ def test_missing_context_fails_closed(monkeypatch):
         def request_context(self):
             raise ValueError("Context is not available outside of a request")
 
-    result = asyncio.run(main.redeploy_service(SVC, ENV, True, ctx=Boom()))
+    result = asyncio.run(main.redeploy_service(SVC, ENV, Boom(), True))
     assert result.startswith("❌")
     assert posted == []
 
@@ -687,3 +726,94 @@ def test_parse_operator_policy_exact_match_tuples():
         json.dumps([{"service_id": SVC[:4], "environment_id": ENV}])
     )
     assert (SVC, ENV) not in prefix
+
+
+def test_variable_keys_lookup_valid_and_empty_list():
+    assert main._variable_keys_from_lookup(
+        {"service": {"variables": [{"key": "A"}, {"key": "B"}]}}
+    ) == {"A", "B"}
+    assert main._variable_keys_from_lookup({"service": {"variables": []}}) == set()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"service": None},
+        {"service": "nope"},
+        {"service": {}},
+        {"service": {"variables": None}},
+        {"service": {"variables": {"key": "A"}}},
+        {"service": {"variables": [{"key": 1}]}},
+        {"service": {"variables": [{"nokey": "A"}]}},
+        {"service": {"variables": [{"key": ""}]}},
+        {"service": {"variables": ["A"]}},
+        {"service": {"variables": [{"key": "A"}, "bad"]}},
+        {"error": "x", "service": {"variables": []}},
+    ],
+)
+def test_variable_keys_lookup_malformed_fails_closed(payload):
+    assert main._variable_keys_from_lookup(payload) is None
+
+
+def test_malformed_key_lookup_does_not_treat_key_as_absent(monkeypatch):
+    enable_writes(monkeypatch)
+
+    async def handler(query, variables, redact_keys):
+        if query == graphql_ops.Q_SERVICE_VARIABLE_KEYS:
+            return {"service": None}
+        raise AssertionError(f"mutation must not run after malformed lookup: {query}")
+
+    posted = _record_gql(monkeypatch, handler)
+    result = asyncio.run(
+        main.set_service_env_var(SVC, ENV, "NEW", ENV_SECRET_VALUE, operator_ctx(), True)
+    )
+    assert result.startswith("❌")
+    assert "lookup failed" in result.lower()
+    assert ENV_SECRET_VALUE not in result
+    assert [p["query"] for p in posted] == [graphql_ops.Q_SERVICE_VARIABLE_KEYS]
+
+
+@pytest.mark.parametrize(
+    "status_code,payload,expected_error",
+    [
+        (200, {"errors": [{"message": f"echo {ENV_SECRET_VALUE}"}]}, "GraphQL error"),
+        (500, {"errors": [{"message": f"echo {ENV_SECRET_VALUE}"}]}, "HTTP 500"),
+    ],
+)
+def test_sensitive_gql_error_does_not_echo_secret(
+    monkeypatch, caplog, status_code, payload, expected_error
+):
+    enable_writes(monkeypatch)
+
+    async def handler(url, body, headers):
+        query = (body or {}).get("query", "")
+        if query == graphql_ops.Q_SERVICE_VARIABLE_KEYS:
+            return _FakeResponse({"data": {"service": {"variables": []}}})
+        return _FakeResponse(payload, status_code=status_code)
+
+    with caplog.at_level(logging.DEBUG):
+        with _patch_client(handler):
+            gql_result = asyncio.run(
+                main.gql(
+                    graphql_ops.M_CREATE_ENVIRONMENT_VARIABLE,
+                    {
+                        "serviceID": SVC,
+                        "environmentID": ENV,
+                        "key": "SECRET_KEY",
+                        "value": ENV_SECRET_VALUE,
+                    },
+                    redact_keys={"value"},
+                )
+            )
+            tool_result = asyncio.run(
+                main.set_service_env_var(
+                    SVC, ENV, "SECRET_KEY", ENV_SECRET_VALUE, operator_ctx(), True
+                )
+            )
+
+    assert gql_result == {"error": expected_error}
+    assert ENV_SECRET_VALUE not in str(gql_result)
+    assert ENV_SECRET_VALUE not in tool_result
+    assert ENV_SECRET_VALUE not in caplog.text
+    assert expected_error in tool_result
