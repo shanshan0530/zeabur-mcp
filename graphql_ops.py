@@ -1,8 +1,7 @@
-"""Read-only Zeabur GraphQL documents used by MCP tools.
+"""Zeabur GraphQL documents used by MCP tools.
 
-Every document in this module must be a GraphQL `query`. Phase A does not
-authorize mutations. Tests import GRAPHQL_DOCUMENTS and fail if a mutation
-is introduced.
+GRAPHQL_DOCUMENTS remains query-only. Write mutations live in MUTATION_DOCUMENTS
+and must not be inlined in main.py.
 
 Log query strings for get_runtime_logs / get_build_logs are frozen copies of
 the operations shipped on main @ 0b8959b28354124c307cfa4c2f36245e3568f2e3.
@@ -131,7 +130,18 @@ Q_GET_ME = """
             }
         """
 
-# Map of every GraphQL document the MCP tools may send.
+# Key-only lookup for env writes. Never request current values.
+Q_SERVICE_VARIABLE_KEYS = """
+            query ServiceVariableKeys($serviceID: ObjectID!, $environmentID: ObjectID!) {
+              service(_id: $serviceID) {
+                variables(environmentID: $environmentID) {
+                  key
+                }
+              }
+            }
+        """
+
+# Map of every GraphQL query the MCP tools may send. Query-only.
 GRAPHQL_DOCUMENTS = {
     "list_projects": Q_LIST_PROJECTS,
     "list_services": Q_LIST_SERVICES,
@@ -144,4 +154,67 @@ GRAPHQL_DOCUMENTS = {
     "get_service": Q_GET_SERVICE,
     "list_regions": Q_LIST_REGIONS,
     "get_me": Q_GET_ME,
+    "service_variable_keys": Q_SERVICE_VARIABLE_KEYS,
+}
+
+# Approved write mutations only. Do not add restart, deploy-from-spec,
+# bulk env-var map updates, or delete-variable operations.
+M_REDEPLOY_SERVICE = """
+            mutation RedeployService(
+              $serviceID: ObjectID!,
+              $environmentID: ObjectID!
+            ) {
+              redeployService(
+                serviceID: $serviceID,
+                environmentID: $environmentID
+              )
+            }
+        """
+
+M_CREATE_ENVIRONMENT_VARIABLE = """
+            mutation CreateEnvironmentVariable(
+              $serviceID: ObjectID!,
+              $environmentID: ObjectID!,
+              $key: String!,
+              $value: String!
+            ) {
+              createEnvironmentVariable(
+                serviceID: $serviceID,
+                environmentID: $environmentID,
+                key: $key,
+                value: $value
+              ) {
+                key
+                exposed
+                readonly
+              }
+            }
+        """
+
+M_UPDATE_SINGLE_ENVIRONMENT_VARIABLE = """
+            mutation UpdateSingleEnvironmentVariable(
+              $serviceID: ObjectID!,
+              $environmentID: ObjectID!,
+              $oldKey: String!,
+              $newKey: String!,
+              $value: String!
+            ) {
+              updateSingleEnvironmentVariable(
+                serviceID: $serviceID,
+                environmentID: $environmentID,
+                oldKey: $oldKey,
+                newKey: $newKey,
+                value: $value
+              ) {
+                key
+                exposed
+                readonly
+              }
+            }
+        """
+
+MUTATION_DOCUMENTS = {
+    "redeploy_service": M_REDEPLOY_SERVICE,
+    "create_environment_variable": M_CREATE_ENVIRONMENT_VARIABLE,
+    "update_single_environment_variable": M_UPDATE_SINGLE_ENVIRONMENT_VARIABLE,
 }

@@ -38,7 +38,14 @@ PHASE_A_EIGHT = {
     "get_deployments",
 }
 
-EXPECTED_REGISTERED = EXISTING_SIX | PHASE_A_EIGHT
+PHASE_A_NINE = EXISTING_SIX | PHASE_A_EIGHT
+
+WRITE_TWO = {
+    "redeploy_service",
+    "set_service_env_var",
+}
+
+EXPECTED_REGISTERED = PHASE_A_NINE | WRITE_TWO
 
 DEFER_OR_REJECT = {
     "search_template",
@@ -97,7 +104,11 @@ def test_phase_a_eight_tools_registered():
 
 
 def test_complete_inventory_is_exactly_expected():
-    assert _tool_names() == EXPECTED_REGISTERED
+    names = _tool_names()
+    assert PHASE_A_NINE <= names
+    assert WRITE_TWO <= names
+    assert names == EXPECTED_REGISTERED
+    assert len(names) == 11
 
 
 def test_defer_and_reject_tools_are_not_registered():

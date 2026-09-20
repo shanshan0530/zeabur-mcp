@@ -152,19 +152,25 @@ def test_url_token_does_not_authorize_sse(monkeypatch):
     asyncio.run(run())
 
 
-def test_tool_inventory_remains_exactly_nine_business_tools():
+def test_tool_inventory_is_exactly_eleven_business_tools():
     names = _tool_names()
     assert names == EXPECTED_REGISTERED
-    assert len(names) == 9
+    assert len(names) == 11
+    assert {"redeploy_service", "set_service_env_var"} <= names
 
 
-def test_no_graphql_mutation_or_write_capability_introduced():
+def test_graphql_documents_remain_query_only_and_main_has_no_inline_mutations():
     for name, document in GRAPHQL_DOCUMENTS.items():
         stripped = document.strip()
         assert stripped.lower().startswith("query"), name
         assert "mutation" not in document.lower(), name
     source = Path(main.__file__).read_text(encoding="utf-8")
-    assert "mutation" not in source.lower()
+    assert "gql(\"\"\"" not in source
+    assert "gql('''" not in source
+    assert "mutation RedeployService" not in source
+    assert "createEnvironmentVariable(" not in source
+    assert "updateSingleEnvironmentVariable(" not in source
+    assert "updateEnvironmentVariable(" not in source
 
 
 def test_query_token_helper_is_mcp_only_and_independent(monkeypatch):
