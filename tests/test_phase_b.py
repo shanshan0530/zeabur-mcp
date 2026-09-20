@@ -47,9 +47,8 @@ FROZEN_READ_SIGNATURES = {
     "get_me": "() -> str",
 }
 
-SVC = "svc-authorized"
-ENV = "env-authorized"
-POLICY_JSON = json.dumps([{"service_id": SVC, "environment_id": ENV}])
+SVC = "svc-1"
+ENV = "env-1"
 OPERATOR_URL_SECRET = "phase-b-operator-url-secret"
 ENV_SECRET_VALUE = "do-not-log-this-env-value"
 
@@ -69,9 +68,8 @@ def read_ctx():
     return make_ctx(main.CAPABILITY_READ)
 
 
-def enable_writes(monkeypatch, policy: str = POLICY_JSON):
+def enable_writes(monkeypatch):
     monkeypatch.setattr(main, "MCP_WRITES_ENABLED", True)
-    monkeypatch.setattr(main, "MCP_OPERATOR_POLICY", policy)
 
 
 def _record_gql(monkeypatch, handler=None):
@@ -384,7 +382,6 @@ def test_concurrent_read_and_operator_do_not_leak_capability(monkeypatch):
 
 def test_writes_disabled_by_default_zero_mutation(monkeypatch):
     assert main.MCP_WRITES_ENABLED is False
-    monkeypatch.setattr(main, "MCP_OPERATOR_POLICY", POLICY_JSON)
     posted = _record_gql(monkeypatch)
     r1 = asyncio.run(main.redeploy_service(SVC, ENV, operator_ctx(), True))
     r2 = asyncio.run(
@@ -399,62 +396,45 @@ def test_writes_disabled_by_default_zero_mutation(monkeypatch):
     assert posted == []
 
 
-@pytest.mark.parametrize(
-    "raw",
-    [
-        "",
-        "[]",
-        "{not json",
-        '{"service_id": "x"}',
-        '[{"service_id": "x"}]',
-        '[{"environment_id": "e"}]',
-        '[{"service_id": 1, "environment_id": "e"}]',
-        '[{"service_id": "", "environment_id": "e"}]',
-        '[{"service_id": "s*", "environment_id": "e"}]',
-        "null",
-        "5",
-    ],
-)
-def test_empty_or_malformed_policy_fail_closed(monkeypatch, raw):
-    monkeypatch.setattr(main, "MCP_WRITES_ENABLED", True)
-    monkeypatch.setattr(main, "MCP_OPERATOR_POLICY", raw)
-    posted = _record_gql(monkeypatch)
-    result = asyncio.run(main.redeploy_service(SVC, ENV, operator_ctx(), True))
-    assert result.startswith("❌")
-    assert posted == []
-    env_result = asyncio.run(
-        main.set_service_env_var(SVC, ENV, "K", ENV_SECRET_VALUE, operator_ctx(), True)
+def test_operator_can_write_when_writes_enabled(monkeypatch):
+    enable_writes(monkeypatch)
+
+    async def handler(query, variables, redact_keys):
+        if query == graphql_ops.M_REDEPLOY_SERVICE:
+            return {"redeployService": True}
+        if query == graphql_ops.Q_SERVICE_VARIABLE_KEYS:
+            return {"service": {"variables": []}}
+        if query == graphql_ops.M_CREATE_ENVIRONMENT_VARIABLE:
+            return {"createEnvironmentVariable": True}
+        raise AssertionError(f"unexpected call: {query}")
+
+    posted = _record_gql(monkeypatch, handler)
+    redeploy = asyncio.run(main.redeploy_service(SVC, ENV, operator_ctx(), True))
+    env_set = asyncio.run(
+        main.set_service_env_var(SVC, ENV, "NEW", ENV_SECRET_VALUE, operator_ctx(), True)
     )
-    assert env_result.startswith("❌")
-    assert posted == []
+    assert "status=success" in redeploy
+    assert "created" in env_set.lower()
+    assert ENV_SECRET_VALUE not in env_set
+    queries = [p["query"] for p in posted]
+    assert graphql_ops.M_REDEPLOY_SERVICE in queries
+    assert graphql_ops.M_CREATE_ENVIRONMENT_VARIABLE in queries
 
 
-def test_wildcard_policy_does_not_prefix_match(monkeypatch):
-    # Exact match only: a literal "*" target does not authorize other ids.
-    enable_writes(
-        monkeypatch,
-        json.dumps([{"service_id": "*", "environment_id": "*"}]),
-    )
-    posted = _record_gql(monkeypatch)
-    result = asyncio.run(main.redeploy_service(SVC, ENV, operator_ctx(), True))
-    assert result.startswith("❌")
-    assert posted == []
+def test_operator_may_write_any_zeabur_token_reachable_target(monkeypatch):
+    enable_writes(monkeypatch)
 
+    async def handler(query, variables, redact_keys):
+        return {"redeployService": True}
 
-def test_target_mismatch_zero_mutation(monkeypatch):
-    enable_writes(
-        monkeypatch,
-        json.dumps([{"service_id": "other-svc", "environment_id": ENV}]),
-    )
-    posted = _record_gql(monkeypatch)
-    result = asyncio.run(main.redeploy_service(SVC, ENV, operator_ctx(), True))
-    assert "not authorized" in result.lower() or "policy" in result.lower()
-    assert posted == []
-    env_result = asyncio.run(
-        main.set_service_env_var(SVC, ENV, "K", ENV_SECRET_VALUE, operator_ctx(), False)
-    )
-    assert env_result.startswith("❌")
-    assert posted == []
+    posted = _record_gql(monkeypatch, handler)
+    first = asyncio.run(main.redeploy_service("svc-a", "env-a", operator_ctx(), True))
+    second = asyncio.run(main.redeploy_service("svc-b", "env-b", operator_ctx(), True))
+    assert "status=success" in first
+    assert "status=success" in second
+    assert len(posted) == 2
+    assert posted[0]["variables"] == {"serviceID": "svc-a", "environmentID": "env-a"}
+    assert posted[1]["variables"] == {"serviceID": "svc-b", "environmentID": "env-b"}
 
 
 def test_confirm_false_redeploy_zero_network(monkeypatch):
@@ -715,17 +695,27 @@ def test_mcp_runtime_pin_requires_1_10():
     assert "mcp[cli]>=1.6.0" not in text
 
 
-def test_parse_operator_policy_exact_match_tuples():
-    parsed = main.parse_operator_policy(POLICY_JSON)
-    assert parsed == frozenset({(SVC, ENV)})
-    assert main.parse_operator_policy("") == frozenset()
-    assert main.parse_operator_policy(None) == frozenset()
-    assert main.parse_operator_policy("{bad") is None
-    assert main.parse_operator_policy('[{"service_id": "s"}]') is None
-    prefix = main.parse_operator_policy(
-        json.dumps([{"service_id": SVC[:4], "environment_id": ENV}])
+def test_operator_policy_fully_removed():
+    production = [
+        ROOT / "main.py",
+        ROOT / "graphql_ops.py",
+        ROOT / "oauth.py",
+        ROOT / "authorize_page.py",
+    ]
+    forbidden = (
+        "MCP_OPERATOR_POLICY",
+        "parse_operator_policy",
+        "_authorized_write_targets",
+        "_target_authorized",
     )
-    assert (SVC, ENV) not in prefix
+    for path in production:
+        text = path.read_text(encoding="utf-8")
+        for token in forbidden:
+            assert token not in text, f"{token} still present in {path.name}"
+    assert not hasattr(main, "MCP_OPERATOR_POLICY")
+    assert not hasattr(main, "parse_operator_policy")
+    assert not hasattr(main, "_authorized_write_targets")
+    assert not hasattr(main, "_target_authorized")
 
 
 def test_variable_keys_lookup_valid_and_empty_list():

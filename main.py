@@ -58,9 +58,6 @@ MCP_OPERATOR_URL_SECRET = os.environ.get("MCP_OPERATOR_URL_SECRET", "").strip()
 MCP_WRITES_ENABLED = os.environ.get("MCP_WRITES_ENABLED", "").strip().lower() in {
     "1", "true", "yes", "on",
 }
-# JSON array of exact {service_id, environment_id} pairs. Empty/unset => no
-# write targets. Malformed JSON or entries => fail closed at use time.
-MCP_OPERATOR_POLICY = os.environ.get("MCP_OPERATOR_POLICY", "").strip()
 # 显式指定对外域名，用于生成 OAuth 元数据里的 URL；不设置则从请求头拼（不完全可靠）
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").strip()
 PORT = int(os.environ.get("PORT", 8765))
@@ -233,47 +230,6 @@ def _err(prefix: str, e: Exception, **ctx) -> str:
     return f"❌ {prefix} 处理出错，已记录日志: {e}"
 
 
-def parse_operator_policy(raw: str | None) -> frozenset[tuple[str, str]] | None:
-    """Parse MCP_OPERATOR_POLICY into exact-match (service_id, environment_id) tuples.
-
-    Empty/unset => empty frozenset (no write targets).
-    Malformed JSON or malformed entries => None (fail closed).
-    No wildcards, no prefix matching, no project_id requirement.
-    """
-    text = (raw or "").strip()
-    if not text:
-        return frozenset()
-    try:
-        data = json.loads(text)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return None
-    if not isinstance(data, list):
-        return None
-    targets: list[tuple[str, str]] = []
-    for entry in data:
-        if not isinstance(entry, dict):
-            return None
-        service_id = entry.get("service_id")
-        environment_id = entry.get("environment_id")
-        if not isinstance(service_id, str) or not isinstance(environment_id, str):
-            return None
-        if not service_id.strip() or not environment_id.strip():
-            return None
-        targets.append((service_id, environment_id))
-    return frozenset(targets)
-
-
-def _authorized_write_targets() -> frozenset[tuple[str, str]] | None:
-    return parse_operator_policy(MCP_OPERATOR_POLICY)
-
-
-def _target_authorized(service_id: str, environment_id: str) -> bool:
-    targets = _authorized_write_targets()
-    if targets is None:
-        return False
-    return (service_id, environment_id) in targets
-
-
 def _capability_from_ctx(ctx) -> str | None:
     """Read request-scoped capability. Missing request/context/state => fail closed."""
     if ctx is None:
@@ -297,19 +253,14 @@ def _capability_from_ctx(ctx) -> str | None:
         return None
 
 
-def _write_preflight(ctx, service_id: str, environment_id: str) -> str | None:
+def _write_preflight(ctx) -> str | None:
     """Shared write gates. Returns a refusal string, or None if the mutation may proceed
-    past capability / master-gate / target-policy checks.
+    past capability / master-gate checks. Target access is whatever ZEABUR_TOKEN can reach.
     """
     if _capability_from_ctx(ctx) != CAPABILITY_OPERATOR:
         return "❌ OPERATOR capability required; write refused"
     if not MCP_WRITES_ENABLED:
         return "❌ Writes are disabled (MCP_WRITES_ENABLED); write refused"
-    targets = _authorized_write_targets()
-    if targets is None:
-        return "❌ Operator policy is invalid; write refused"
-    if (service_id, environment_id) not in targets:
-        return "❌ Target is not authorized by MCP_OPERATOR_POLICY; write refused"
     return None
 
 
@@ -603,14 +554,15 @@ async def redeploy_service(
     ctx: Context,
     confirm: bool = False,
 ) -> str:
-    """Redeploy an authorized Zeabur service in one environment.
+    """Redeploy a Zeabur service in one environment.
 
     This is redeploy, not restart, and not "deploy latest main".
-    Requires OPERATOR capability, MCP_WRITES_ENABLED, an exact policy match,
-    and confirm=true. confirm=false performs zero network calls.
+    Requires OPERATOR capability, MCP_WRITES_ENABLED, and confirm=true.
+    confirm=false performs zero network calls. Target access is whatever
+    ZEABUR_TOKEN itself can reach; there is no MCP-side service allowlist.
     """
     try:
-        refusal = _write_preflight(ctx, service_id, environment_id)
+        refusal = _write_preflight(ctx)
         if refusal:
             return refusal
         if not confirm:
@@ -676,14 +628,15 @@ async def set_service_env_var(
     ctx: Context,
     confirm: bool = False,
 ) -> str:
-    """Create or update one environment variable on an authorized service/environment.
+    """Create or update one environment variable on a service/environment.
 
     Looks up KEYS only (never current values). confirm=false reports would-create
     or would-update and performs no mutation. Does not redeploy afterwards.
-    The supplied value is never returned or logged.
+    The supplied value is never returned or logged. Target access is whatever
+    ZEABUR_TOKEN itself can reach; there is no MCP-side service allowlist.
     """
     try:
-        refusal = _write_preflight(ctx, service_id, environment_id)
+        refusal = _write_preflight(ctx)
         if refusal:
             return refusal
         lookup = await gql(
@@ -1187,7 +1140,7 @@ if __name__ == "__main__":
     if MCP_OPERATOR_URL_SECRET:
         logger.info("MCP_OPERATOR_URL_SECRET 已配置，/mcp 支持独立 operator ?token= 鉴权")
     if MCP_WRITES_ENABLED:
-        logger.info("MCP_WRITES_ENABLED 已开启，write tools 仍受 OPERATOR 与目标策略约束")
+        logger.info("MCP_WRITES_ENABLED 已开启，write tools 仍受 OPERATOR 能力约束")
     else:
         logger.info("MCP_WRITES_ENABLED 未开启，write tools 拒绝任何变更")
     if not PUBLIC_BASE_URL:
