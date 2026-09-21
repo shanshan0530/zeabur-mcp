@@ -152,11 +152,12 @@ def test_url_token_does_not_authorize_sse(monkeypatch):
     asyncio.run(run())
 
 
-def test_tool_inventory_is_exactly_eleven_business_tools():
+def test_tool_inventory_is_exactly_thirteen_business_tools():
     names = _tool_names()
     assert names == EXPECTED_REGISTERED
-    assert len(names) == 11
+    assert len(names) == 13
     assert {"redeploy_service", "set_service_env_var"} <= names
+    assert {"get_service_env_var", "get_service_metrics"} <= names
 
 
 def test_graphql_documents_remain_query_only_and_main_has_no_inline_mutations():

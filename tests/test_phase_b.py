@@ -24,6 +24,7 @@ from graphql_ops import GRAPHQL_DOCUMENTS, MUTATION_DOCUMENTS
 from tests.test_phase_a import (
     EXPECTED_REGISTERED,
     PHASE_A_NINE,
+    READ_ONLY_OPS_TWO,
     TEST_SECRET,
     TEST_TOKEN,
     WRITE_TWO,
@@ -38,7 +39,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FROZEN_READ_SIGNATURES = {
     "list_projects": "() -> str",
     "list_services": "(project_id: str) -> str",
-    "get_runtime_logs": "(service_id: str, environment_id: str, project_id: str) -> str",
+    "get_runtime_logs": "(service_id: str, environment_id: str, project_id: str, deployment_id: str | None = None, timestamp_cursor: str | None = None, start_time: str | None = None, end_time: str | None = None, keyword: str | None = None, tail: int = 100, max_pages: int = 5) -> str",
     "get_deployments": "(service_id: str, environment_id: str, project_id: str) -> str",
     "get_build_logs": "(deployment_id: str, project_id: str, tail: int = 30, errors_only: bool = True) -> str",
     "scan_all_logs": "() -> str",
@@ -75,8 +76,15 @@ def enable_writes(monkeypatch):
 def _record_gql(monkeypatch, handler=None):
     posted: list[dict] = []
 
-    async def fake(query, variables=None, *, redact_keys=None):
-        posted.append({"query": query, "variables": variables, "redact_keys": redact_keys})
+    async def fake(query, variables=None, *, redact_keys=None, redact_response=False):
+        posted.append(
+            {
+                "query": query,
+                "variables": variables,
+                "redact_keys": redact_keys,
+                "redact_response": redact_response,
+            }
+        )
         if handler:
             return await handler(query, variables, redact_keys)
         return {}
@@ -127,6 +135,9 @@ def test_original_nine_tools_remain_with_unchanged_signatures():
         "environment_id",
         "project_id",
     }
+    runtime_props = tools["get_runtime_logs"].inputSchema["properties"]
+    assert runtime_props["tail"]["default"] == 100
+    assert runtime_props["max_pages"]["default"] == 5
     assert set(tools["get_deployments"].inputSchema["required"]) == {
         "service_id",
         "environment_id",
@@ -137,11 +148,12 @@ def test_original_nine_tools_remain_with_unchanged_signatures():
     assert build_props["errors_only"]["default"] is True
 
 
-def test_exactly_two_new_write_tools_and_inventory_is_eleven():
+def test_exactly_two_write_tools_and_inventory_is_thirteen():
     names = _tool_names()
     assert names == EXPECTED_REGISTERED
-    assert len(names) == 11
-    assert names - PHASE_A_NINE == WRITE_TWO
+    assert len(names) == 13
+    assert names - PHASE_A_NINE - READ_ONLY_OPS_TWO == WRITE_TWO
+    assert READ_ONLY_OPS_TWO <= names
     tools = {t.name: t for t in asyncio.run(main.mcp.list_tools())}
     for write_name in WRITE_TWO:
         schema = tools[write_name].inputSchema
@@ -335,7 +347,9 @@ def test_operator_can_still_execute_all_read_tools():
         asyncio.run(main.list_regions())
         asyncio.run(main.get_me())
         asyncio.run(main.scan_all_logs())
-    assert len(posted_queries) == 9
+        asyncio.run(main.get_service_env_var("s", "e", "K"))
+        asyncio.run(main.get_service_metrics("s", "e", "p", "CPU"))
+    assert len(posted_queries) == 11
     assert all(q.strip().lower().startswith("query") for q in posted_queries)
 
 
@@ -648,7 +662,7 @@ def test_no_mutation_or_network_at_import_or_list_tools():
     finally:
         main.gql = original  # type: ignore[method-assign]
     assert posted == []
-    assert len(names) == 11
+    assert len(names) == 13
 
 
 def test_existing_url_token_read_behavior_still_works(monkeypatch):
@@ -802,7 +816,7 @@ def test_sensitive_gql_error_does_not_echo_secret(
                 )
             )
 
-    assert gql_result == {"error": expected_error}
+    assert gql_result["error"] == expected_error
     assert ENV_SECRET_VALUE not in str(gql_result)
     assert ENV_SECRET_VALUE not in tool_result
     assert ENV_SECRET_VALUE not in caplog.text

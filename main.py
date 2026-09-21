@@ -4,6 +4,7 @@ import asyncio
 import logging
 import secrets
 import traceback
+from datetime import datetime, timedelta, timezone
 import httpx
 from urllib.parse import parse_qs, urlparse
 from fastapi import FastAPI, Request
@@ -25,6 +26,8 @@ from graphql_ops import (
     Q_GET_ME,
     Q_GET_RUNTIME_LOGS,
     Q_GET_SERVICE,
+    Q_GET_SERVICE_ENV_VAR,
+    Q_GET_SERVICE_METRICS,
     Q_LIST_PROJECTS,
     Q_LIST_REGIONS,
     Q_LIST_SERVICES,
@@ -143,15 +146,29 @@ def _safe_gql_variables(variables: dict | None, redact_keys: set | frozenset | N
     return safe
 
 
-async def gql(query: str, variables: dict = None, *, redact_keys: set | frozenset | None = None) -> dict:
+def _gql_error(message, *, kind: str, status_code: int | None = None) -> dict:
+    payload = {"error": message, "error_kind": kind}
+    if status_code is not None:
+        payload["status_code"] = status_code
+    return payload
+
+
+async def gql(
+    query: str,
+    variables: dict = None,
+    *,
+    redact_keys: set | frozenset | None = None,
+    redact_response: bool = False,
+) -> dict:
     """调用 Zeabur GraphQL API。所有网络/解析异常均在此处捕获并记录日志，不会向上抛出。
 
     redact_keys: variable names whose values must never appear in logs (env writes).
+    redact_response: never log or echo response bodies (env reads).
     Authorization headers and ZEABUR_TOKEN are never logged.
     """
     if not ZEABUR_TOKEN:
         logger.error("gql 调用失败: ZEABUR_TOKEN 未设置")
-        return {"error": "ZEABUR_TOKEN 未设置"}
+        return _gql_error("ZEABUR_TOKEN 未设置", kind="token")
 
     headers = {
         "Content-Type": "application/json",
@@ -162,7 +179,7 @@ async def gql(query: str, variables: dict = None, *, redact_keys: set | frozense
         body["variables"] = variables
 
     log_vars = _safe_gql_variables(variables, redact_keys)
-    redact_body = bool(redact_keys)
+    redact_body = bool(redact_keys) or redact_response
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -171,19 +188,19 @@ async def gql(query: str, variables: dict = None, *, redact_keys: set | frozense
         logger.error(
             "gql 请求超时 | variables=%s\n%s", log_vars, traceback.format_exc()
         )
-        return {"error": "请求 Zeabur API 超时（30s），请稍后重试"}
+        return _gql_error("请求 Zeabur API 超时（30s），请稍后重试", kind="timeout")
     except httpx.RequestError as e:
         logger.error(
             "gql 网络请求异常: %s | variables=%s\n%s",
             e, log_vars, traceback.format_exc()
         )
-        return {"error": f"网络请求失败: {e}"}
+        return _gql_error(f"网络请求失败: {e}", kind="network")
     except Exception as e:
         logger.error(
             "gql 请求发生未预期异常: %s | variables=%s\n%s",
             e, log_vars, traceback.format_exc()
         )
-        return {"error": f"请求异常: {e}"}
+        return _gql_error(f"请求异常: {e}", kind="unexpected")
 
     try:
         data = resp.json()
@@ -194,7 +211,11 @@ async def gql(query: str, variables: dict = None, *, redact_keys: set | frozense
             "[REDACTED]" if redact_body else resp.text[:500],
             traceback.format_exc(),
         )
-        return {"error": f"Zeabur API 返回了非 JSON 响应 (HTTP {resp.status_code})"}
+        return _gql_error(
+            f"Zeabur API 返回了非 JSON 响应 (HTTP {resp.status_code})",
+            kind="parse",
+            status_code=resp.status_code,
+        )
 
     if resp.status_code >= 400:
         if redact_body:
@@ -202,12 +223,18 @@ async def gql(query: str, variables: dict = None, *, redact_keys: set | frozense
                 "gql HTTP 错误 status=%s | variables=%s | body=[REDACTED]",
                 resp.status_code, log_vars,
             )
-            return {"error": f"HTTP {resp.status_code}"}
+            return _gql_error(
+                f"HTTP {resp.status_code}", kind="http", status_code=resp.status_code
+            )
         logger.error(
             "gql HTTP 错误 status=%s | variables=%s | body=%s",
             resp.status_code, log_vars, data
         )
-        return {"error": data.get("errors") or f"HTTP {resp.status_code}: {data}"}
+        return _gql_error(
+            data.get("errors") or f"HTTP {resp.status_code}: {data}",
+            kind="http",
+            status_code=resp.status_code,
+        )
 
     if "errors" in data:
         if redact_body:
@@ -215,11 +242,11 @@ async def gql(query: str, variables: dict = None, *, redact_keys: set | frozense
                 "gql GraphQL 错误 | variables=%s | errors=[REDACTED]",
                 log_vars,
             )
-            return {"error": "GraphQL error"}
+            return _gql_error("GraphQL error", kind="graphql")
         logger.error(
             "gql GraphQL 错误 | variables=%s | errors=%s", log_vars, data["errors"]
         )
-        return {"error": data["errors"]}
+        return _gql_error(data["errors"], kind="graphql")
 
     return data.get("data", {})
 
@@ -262,6 +289,259 @@ def _write_preflight(ctx) -> str | None:
     if not MCP_WRITES_ENABLED:
         return "❌ Writes are disabled (MCP_WRITES_ENABLED); write refused"
     return None
+
+
+# ── Read-only ops helpers ─────────────────────────────────────────────────
+
+STATUS_NO_LOGS = "NO_LOGS"
+STATUS_API_UNAVAILABLE = "API_UNAVAILABLE"
+STATUS_PERMISSION_DENIED = "PERMISSION_DENIED"
+STATUS_UNSUPPORTED = "UNSUPPORTED"
+STATUS_IMPLEMENTATION_ERROR = "IMPLEMENTATION_ERROR"
+STATUS_API_ERROR = "API_ERROR"
+STATUS_PARTIAL = "PARTIAL"
+STATUS_OK = "OK"
+
+DEFAULT_RUNTIME_LOG_TAIL = 100
+DEFAULT_RUNTIME_LOG_PAGES = 5
+MAX_RUNTIME_LOG_PAGES = 20
+MAX_RUNTIME_LOG_TAIL = 1000
+
+SERVICE_METRIC_TYPES = frozenset({"CPU", "MEMORY", "NETWORK", "DISK", "LATENCY"})
+
+NON_SENSITIVE_ENV_KEYS = frozenset({"DRIVESOID_SHADOW_ENABLED"})
+
+# Conservative sensitive-key tokens. Matched as uppercase substrings.
+SENSITIVE_ENV_TOKENS = (
+    "SECRET",
+    "TOKEN",
+    "PASSWORD",
+    "PASSWD",
+    "PRIVATE_KEY",
+    "API_KEY",
+    "ACCESS_KEY",
+    "CREDENTIAL",
+    "AUTH",
+    "COOKIE",
+    "SESSION",
+    "DSN",
+    "CONNECTION_STRING",
+)
+
+# Obvious credential-bearing database / broker connection variables.
+SENSITIVE_DB_ENV_KEYS = (
+    "DATABASE_URL",
+    "DATABASE_URI",
+    "DB_URL",
+    "DB_URI",
+    "DB_PASSWORD",
+    "DB_PASSWD",
+    "DB_PASS",
+    "POSTGRES_URL",
+    "POSTGRES_URI",
+    "POSTGRES_PASSWORD",
+    "PGPASSWORD",
+    "MYSQL_URL",
+    "MYSQL_URI",
+    "MYSQL_PASSWORD",
+    "MONGO_URL",
+    "MONGODB_URI",
+    "MONGO_URI",
+    "REDIS_URL",
+    "REDIS_URI",
+    "REDIS_PASSWORD",
+    "AMQP_URL",
+    "RABBITMQ_URL",
+    "KAFKA_URL",
+    "DATABASE_DSN",
+    "DB_DSN",
+)
+
+_PERMISSION_MARKERS = (
+    "permission denied",
+    "permission_denied",
+    "forbidden",
+    "unauthorized",
+    "not authorized",
+    "access denied",
+    "not allowed",
+    "unauthenticated",
+)
+_UNSUPPORTED_MARKERS = (
+    "unknown field",
+    "cannot query field",
+    "unknown argument",
+    "fieldundefined",
+    "field undefined",
+    "is not defined",
+    "cannot be used",
+    "did you mean",
+    "unknown type",
+)
+
+
+def _error_text(error) -> str:
+    if error is None:
+        return ""
+    if isinstance(error, str):
+        return error
+    try:
+        return json.dumps(error, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(error)
+
+
+def classify_api_failure(data: dict) -> str:
+    """Map a gql() error payload to a runtime-log / fetch outcome class."""
+    kind = data.get("error_kind")
+    status_code = data.get("status_code")
+    text = _error_text(data.get("error")).lower()
+
+    if kind == "token":
+        return STATUS_API_UNAVAILABLE
+    if kind in ("timeout", "network"):
+        return STATUS_API_UNAVAILABLE
+    if kind == "unexpected":
+        return STATUS_IMPLEMENTATION_ERROR
+    if status_code in (401, 403):
+        return STATUS_PERMISSION_DENIED
+    if any(marker in text for marker in _PERMISSION_MARKERS):
+        return STATUS_PERMISSION_DENIED
+    if any(marker in text for marker in _UNSUPPORTED_MARKERS):
+        return STATUS_UNSUPPORTED
+    if kind in ("http", "graphql", "parse"):
+        return STATUS_API_ERROR
+    return STATUS_API_ERROR
+
+
+def _format_classified_failure(code: str, data: dict | None = None, **extra) -> str:
+    lines = [f"status={code}"]
+    for key, value in extra.items():
+        if value is not None:
+            lines.append(f"{key}={value}")
+    if data is not None:
+        detail = _error_text(data.get("error"))
+        if detail:
+            lines.append(f"detail={detail}")
+    return "\n".join(lines)
+
+
+def _bound_max_pages(max_pages: int) -> int:
+    try:
+        n = int(max_pages)
+    except (TypeError, ValueError):
+        return DEFAULT_RUNTIME_LOG_PAGES
+    return max(1, min(n, MAX_RUNTIME_LOG_PAGES))
+
+
+def _bound_tail(tail: int) -> int:
+    try:
+        n = int(tail)
+    except (TypeError, ValueError):
+        return DEFAULT_RUNTIME_LOG_TAIL
+    return max(0, min(n, MAX_RUNTIME_LOG_TAIL))
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value or not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except ValueError:
+        return None
+
+
+def _timestamp_le(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    left_dt = _parse_iso(left)
+    right_dt = _parse_iso(right)
+    if left_dt and right_dt:
+        return left_dt <= right_dt
+    return left <= right
+
+
+def _in_time_range(ts: str | None, start: str | None, end: str | None) -> bool:
+    if not start and not end:
+        return True
+    parsed = _parse_iso(ts)
+    start_dt = _parse_iso(start)
+    end_dt = _parse_iso(end)
+    if parsed is not None:
+        if start_dt and parsed < start_dt:
+            return False
+        if end_dt and parsed > end_dt:
+            return False
+        if start and start_dt is None and (ts or "") < start:
+            return False
+        if end and end_dt is None and (ts or "") > end:
+            return False
+        return True
+    if start and (ts or "") < start:
+        return False
+    if end and (ts or "") > end:
+        return False
+    return True
+
+
+def _reached_start(logs: list, start_time: str | None) -> bool:
+    if not start_time or not logs:
+        return False
+    last = logs[-1] if isinstance(logs[-1], dict) else {}
+    return _timestamp_le(last.get("timestamp"), start_time)
+
+
+def _env_key_is_sensitive(key: str) -> bool:
+    if key in NON_SENSITIVE_ENV_KEYS:
+        return False
+    upper = key.upper()
+    if upper in NON_SENSITIVE_ENV_KEYS:
+        return False
+    for token in SENSITIVE_ENV_TOKENS:
+        if token in upper:
+            return True
+    for db_key in SENSITIVE_DB_ENV_KEYS:
+        if db_key in upper:
+            return True
+    return False
+
+
+def _service_variables_entries(data: dict) -> list[dict] | None:
+    """Return env entries (key+value), or None on lookup failure. Empty list is valid."""
+    if "error" in data:
+        return None
+    service = data.get("service")
+    if not isinstance(service, dict):
+        return None
+    if "variables" not in service:
+        return None
+    variables = service["variables"]
+    if not isinstance(variables, list):
+        return None
+    entries = []
+    for item in variables:
+        if not isinstance(item, dict):
+            return None
+        key = item.get("key")
+        if not isinstance(key, str) or not key:
+            return None
+        entries.append(item)
+    return entries
+
+
+def _deployment_ts(node: dict, field: str) -> str:
+    value = node.get(field)
+    if value is None or value == "":
+        return STATUS_UNSUPPORTED
+    return str(value)
 
 
 # ── MCP 工具 ───────────────────────────────────────────────────────────
@@ -309,42 +589,196 @@ async def list_services(project_id: str) -> str:
 
 
 @mcp.tool()
-async def get_runtime_logs(service_id: str, environment_id: str, project_id: str) -> str:
+async def get_runtime_logs(
+    service_id: str,
+    environment_id: str,
+    project_id: str,
+    deployment_id: str | None = None,
+    timestamp_cursor: str | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    keyword: str | None = None,
+    tail: int = DEFAULT_RUNTIME_LOG_TAIL,
+    max_pages: int = DEFAULT_RUNTIME_LOG_PAGES,
+) -> str:
     """获取服务运行时日志（启动输出、报错等）。
-    service_id 从 list_services 获取，environment_id 和 project_id 从 list_projects 获取。"""
+
+    Required (backward-compatible): service_id, environment_id, project_id.
+    Optional: deployment_id, timestamp_cursor, start_time, end_time, keyword, tail, max_pages.
+    API failures are classified (NO_LOGS / API_UNAVAILABLE / PERMISSION_DENIED /
+    UNSUPPORTED / IMPLEMENTATION_ERROR / API_ERROR) and are never reported as empty logs.
+    """
     try:
-        data = await gql(Q_GET_RUNTIME_LOGS, {"projectID": project_id, "serviceID": service_id, "environmentID": environment_id})
-        if "error" in data:
-            return f"❌ {data['error']}"
-        logs = data.get("runtimeLogs", [])
-        if not logs:
-            return "📭 没有运行时日志"
-        lines = [f"📋 Runtime 日志（共 {len(logs)} 条，显示最后 50 条）"]
-        for entry in logs[-50:]:
+        cursor = timestamp_cursor
+        seen_cursors: set[str] = set()
+        pages_used = 0
+        collected: list = []
+        max_pages_bound = _bound_max_pages(max_pages)
+        tail_bound = _bound_tail(tail)
+        last_page_len = 0
+        stopped_reason = None
+
+        while pages_used < max_pages_bound:
+            if cursor:
+                if cursor in seen_cursors:
+                    stopped_reason = "repeated_cursor"
+                    break
+                seen_cursors.add(cursor)
+
+            variables = {
+                "projectID": project_id,
+                "serviceID": service_id,
+                "environmentID": environment_id,
+            }
+            if deployment_id:
+                variables["deploymentID"] = deployment_id
+            if cursor:
+                variables["timestampCursor"] = cursor
+
+            data = await gql(Q_GET_RUNTIME_LOGS, variables)
+            pages_used += 1
+            if "error" in data:
+                return _format_classified_failure(
+                    classify_api_failure(data),
+                    data,
+                    service_id=service_id,
+                    environment_id=environment_id,
+                    project_id=project_id,
+                )
+
+            if "runtimeLogs" not in data:
+                return _format_classified_failure(
+                    STATUS_API_ERROR,
+                    {"error": "runtimeLogs field missing from successful response"},
+                    service_id=service_id,
+                )
+            logs = data["runtimeLogs"]
+            if logs is None:
+                return _format_classified_failure(
+                    STATUS_API_ERROR,
+                    {"error": "runtimeLogs is null"},
+                    service_id=service_id,
+                )
+            if not isinstance(logs, list):
+                return _format_classified_failure(
+                    STATUS_API_ERROR,
+                    {"error": "runtimeLogs is not a list"},
+                    service_id=service_id,
+                )
+
+            last_page_len = len(logs)
+            if not logs:
+                stopped_reason = "empty_page"
+                break
+
+            collected.extend(logs)
+            if _reached_start(logs, start_time):
+                stopped_reason = "range_satisfied"
+                break
+
+            last_entry = logs[-1] if isinstance(logs[-1], dict) else {}
+            next_cursor = last_entry.get("timestamp")
+            if not next_cursor:
+                stopped_reason = "empty_page"
+                break
+            if next_cursor == cursor:
+                stopped_reason = "repeated_cursor"
+                break
+            cursor = next_cursor
+
+        if stopped_reason is None:
+            if pages_used >= max_pages_bound and last_page_len > 0:
+                stopped_reason = "max_pages"
+            else:
+                stopped_reason = "complete"
+
+        if not collected:
+            return _format_classified_failure(
+                STATUS_NO_LOGS,
+                service_id=service_id,
+                environment_id=environment_id,
+                project_id=project_id,
+                pages=pages_used,
+            )
+
+        keyword_lc = keyword.lower() if keyword else None
+        filtered = []
+        for entry in collected:
+            if not isinstance(entry, dict):
+                continue
+            if not _in_time_range(entry.get("timestamp"), start_time, end_time):
+                continue
+            if keyword_lc and keyword_lc not in str(entry.get("message") or "").lower():
+                continue
+            filtered.append(entry)
+
+        show = filtered[-tail_bound:] if tail_bound else []
+        range_requested = bool(start_time or end_time)
+        partial = (
+            stopped_reason == "max_pages"
+            and range_requested
+            and last_page_len > 0
+        )
+        status = STATUS_PARTIAL if partial else STATUS_OK
+        lines = [
+            f"status={status}",
+            f"count={len(show)}",
+            f"matched={len(filtered)}",
+            f"fetched={len(collected)}",
+            f"pages={pages_used}",
+        ]
+        if partial:
+            lines.append("reason=max_pages truncated requested range")
+        for entry in show:
             ts = (entry.get("timestamp") or "")[:19]
             lines.append(f"[{ts}] {entry.get('message', '')}")
         return "\n".join(lines)
     except Exception as e:
-        return _err("get_runtime_logs", e, service_id=service_id, environment_id=environment_id, project_id=project_id)
+        return (
+            f"status={STATUS_IMPLEMENTATION_ERROR}\n"
+            + _err(
+                "get_runtime_logs",
+                e,
+                service_id=service_id,
+                environment_id=environment_id,
+                project_id=project_id,
+            )
+        )
 
 
 @mcp.tool()
 async def get_deployments(service_id: str, environment_id: str, project_id: str) -> str:
-    """获取服务的部署列表（含 deployment_id 和状态）。
+    """获取服务的部署列表（含 deployment_id、status、createdAt、startedAt、finishedAt、
+    ref、commitSHA、commitMessage、scheduledAt）。
     查 build 日志前需先调用此工具获取 deployment_id。
-    project_id 和 environment_id 从 list_projects 获取。"""
+    service_id / environment_id 用于查询。
+    project_id is unused (kept for backward compatibility) and is not sent to the API.
+    Fields not returned by the API are reported as UNSUPPORTED.
+    Restart reason, exit code, restart count, and deploy-vs-restart event type are not inferred.
+    """
     try:
         data = await gql(Q_GET_DEPLOYMENTS, {"serviceID": service_id, "environmentID": environment_id})
         if "error" in data:
             return f"❌ {data['error']}"
-        edges = data.get("deployments", {}).get("edges", [])
+        deployments = data.get("deployments")
+        if not isinstance(deployments, dict):
+            return "📭 没有部署记录"
+        edges = deployments.get("edges", [])
         if not edges:
             return "📭 没有部署记录"
         lines = ["📋 部署列表"]
         for e in edges:
             n = e["node"]
             ts = (n.get("createdAt") or "")[:19]
-            lines.append(f"[{ts}] {n['status']}  deployment_id: {n['_id']}")
+            lines.append(
+                f"[{ts}] {n['status']}  deployment_id: {n['_id']}  "
+                f"startedAt: {_deployment_ts(n, 'startedAt')}  "
+                f"finishedAt: {_deployment_ts(n, 'finishedAt')}  "
+                f"ref: {_deployment_ts(n, 'ref')}  "
+                f"commitSHA: {_deployment_ts(n, 'commitSHA')}  "
+                f"commitMessage: {_deployment_ts(n, 'commitMessage')}  "
+                f"scheduledAt: {_deployment_ts(n, 'scheduledAt')}"
+            )
         return "\n".join(lines)
     except Exception as e:
         return _err("get_deployments", e, service_id=service_id, environment_id=environment_id, project_id=project_id)
@@ -382,7 +816,11 @@ async def get_build_logs(deployment_id: str, project_id: str, tail: int = 30, er
 @mcp.tool()
 async def scan_all_logs() -> str:
     """并发扫描所有项目下所有服务（含所有环境）的运行时日志，过滤出包含错误关键词的行。
-    用于快速排查所有服务健康状态，无需逐个查询。"""
+    用于快速排查所有服务健康状态，无需逐个查询。
+
+    Per-service outcomes: CLEAN / ERROR_MATCH / NO_LOGS / FETCH_FAILED.
+    Empty runtimeLogs is NO_LOGS, not CLEAN. Fetch errors are never reported as healthy.
+    """
     try:
         ERROR_KEYWORDS = {"error", "exception", "traceback", "failed", "critical", "fatal", "crash"}
 
@@ -403,42 +841,125 @@ async def scan_all_logs() -> str:
             return "📭 没有项目或项目下没有环境"
 
         async def get_services(pe):
-            d = await gql(Q_SCAN_SERVICES, {"projectID": pe["project_id"]})
-            if "error" in d:
-                logger.error("scan_all_logs 获取服务失败 | project=%s error=%s", pe["project_name"], d["error"])
-                return []
-            return [
-                {"id": s["node"]["_id"], "name": s["node"]["name"],
-                 "project_name": pe["project_name"], "project_id": pe["project_id"],
-                 "env_id": pe["env_id"], "env_name": pe["env_name"]}
-                for s in d.get("services", {}).get("edges", [])
-            ]
+            try:
+                d = await gql(Q_SCAN_SERVICES, {"projectID": pe["project_id"]})
+                if "error" in d:
+                    logger.error(
+                        "scan_all_logs 获取服务失败 | project=%s error=%s",
+                        pe["project_name"], d["error"],
+                    )
+                    return {
+                        "failed": True,
+                        "pe": pe,
+                        "error_class": classify_api_failure(d),
+                        "error": d["error"],
+                    }
+                return {
+                    "failed": False,
+                    "services": [
+                        {
+                            "id": s["node"]["_id"],
+                            "name": s["node"]["name"],
+                            "project_name": pe["project_name"],
+                            "project_id": pe["project_id"],
+                            "env_id": pe["env_id"],
+                            "env_name": pe["env_name"],
+                        }
+                        for s in d.get("services", {}).get("edges", [])
+                    ],
+                }
+            except Exception as e:
+                logger.error(
+                    "scan_all_logs 获取服务时异常: %s\n%s", e, traceback.format_exc()
+                )
+                return {
+                    "failed": True,
+                    "pe": pe,
+                    "error_class": STATUS_IMPLEMENTATION_ERROR,
+                    "error": str(e),
+                }
 
         all_services_nested = await asyncio.gather(
             *[get_services(pe) for pe in project_envs], return_exceptions=True
         )
         all_services = []
-        for item in all_services_nested:
+        fetch_failed = []
+        for i, item in enumerate(all_services_nested):
             if isinstance(item, Exception):
+                pe = project_envs[i]
+                label = f"{pe['project_name']}/{pe['env_name']}"
                 logger.error("scan_all_logs 获取服务时异常: %s\n%s", item, traceback.format_exc())
+                fetch_failed.append((label, STATUS_IMPLEMENTATION_ERROR, str(item)))
                 continue
-            all_services.extend(item)
+            if item.get("failed"):
+                pe = item["pe"]
+                label = f"{pe['project_name']}/{pe['env_name']}"
+                fetch_failed.append(
+                    (label, item.get("error_class", "FETCH_FAILED"), _error_text(item.get("error")))
+                )
+                continue
+            all_services.extend(item.get("services") or [])
 
-        if not all_services:
+        if not all_services and not fetch_failed:
             return "📭 没有服务"
 
         async def scan_service(service):
-            d = await gql(Q_SCAN_RUNTIME_LOGS, {"projectID": service["project_id"], "serviceID": service["id"], "environmentID": service["env_id"]})
-            if "error" in d:
-                logger.error("scan_all_logs 获取日志失败 | service=%s error=%s", service["name"], d["error"])
-                return service, [f"  ⚠️ 获取该服务日志失败: {d['error']}"]
-            logs = d.get("runtimeLogs", [])
-            errors = [
-                f"  [{(e.get('timestamp') or '')[:19]}] {e.get('message', '')}"
-                for e in logs
-                if any(kw in e.get("message", "").lower() for kw in ERROR_KEYWORDS)
-            ]
-            return service, errors
+            try:
+                d = await gql(
+                    Q_SCAN_RUNTIME_LOGS,
+                    {
+                        "projectID": service["project_id"],
+                        "serviceID": service["id"],
+                        "environmentID": service["env_id"],
+                    },
+                )
+                if "error" in d:
+                    logger.error(
+                        "scan_all_logs 获取日志失败 | service=%s error=%s",
+                        service["name"], d["error"],
+                    )
+                    return {
+                        "status": "FETCH_FAILED",
+                        "service": service,
+                        "error_class": classify_api_failure(d),
+                        "error": d["error"],
+                    }
+                if "runtimeLogs" not in d:
+                    return {
+                        "status": "FETCH_FAILED",
+                        "service": service,
+                        "error_class": STATUS_API_ERROR,
+                        "error": "runtimeLogs field missing",
+                    }
+                logs = d["runtimeLogs"]
+                if logs is None or not isinstance(logs, list):
+                    return {
+                        "status": "FETCH_FAILED",
+                        "service": service,
+                        "error_class": STATUS_API_ERROR,
+                        "error": "runtimeLogs is not a list",
+                    }
+                if not logs:
+                    return {"status": STATUS_NO_LOGS, "service": service}
+                errors = [
+                    f"  [{(e.get('timestamp') or '')[:19]}] {e.get('message', '')}"
+                    for e in logs
+                    if isinstance(e, dict)
+                    and any(kw in e.get("message", "").lower() for kw in ERROR_KEYWORDS)
+                ]
+                if errors:
+                    return {"status": "ERROR_MATCH", "service": service, "errors": errors}
+                return {"status": "CLEAN", "service": service}
+            except Exception as e:
+                logger.error(
+                    "scan_all_logs 扫描服务时异常: %s\n%s", e, traceback.format_exc()
+                )
+                return {
+                    "status": "FETCH_FAILED",
+                    "service": service,
+                    "error_class": STATUS_IMPLEMENTATION_ERROR,
+                    "error": str(e),
+                }
 
         results = await asyncio.gather(
             *[scan_service(s) for s in all_services], return_exceptions=True
@@ -446,32 +967,75 @@ async def scan_all_logs() -> str:
 
         has_errors = []
         clean = []
-        for item in results:
+        no_logs = []
+        for i, item in enumerate(results):
             if isinstance(item, Exception):
+                service = all_services[i]
+                label = f"{service['project_name']}/{service['env_name']}/{service['name']}"
                 logger.error("scan_all_logs 扫描服务时异常: %s\n%s", item, traceback.format_exc())
+                fetch_failed.append((label, STATUS_IMPLEMENTATION_ERROR, str(item)))
                 continue
-            service, errors = item
+            service = item["service"]
             label = f"{service['project_name']}/{service['env_name']}/{service['name']}"
-            if errors:
-                has_errors.append((label, errors))
-            else:
+            status = item["status"]
+            if status == "ERROR_MATCH":
+                has_errors.append((label, item.get("errors") or []))
+            elif status == STATUS_NO_LOGS:
+                no_logs.append(label)
+            elif status == "FETCH_FAILED":
+                fetch_failed.append(
+                    (
+                        label,
+                        item.get("error_class", STATUS_API_ERROR),
+                        _error_text(item.get("error")),
+                    )
+                )
+            elif status == "CLEAN":
                 clean.append(label)
+            else:
+                fetch_failed.append((label, STATUS_IMPLEMENTATION_ERROR, status))
 
-        if not has_errors:
-            return f"✅ 所有服务正常，未检测到错误\n   扫描了 {len(all_services)} 个服务（{len(project_envs)} 个项目-环境组合）: {', '.join(clean)}"
+        scanned = len(all_services)
+        lines = [
+            (
+                f"扫描摘要: scanned={scanned} CLEAN={len(clean)} "
+                f"ERROR_MATCH={len(has_errors)} NO_LOGS={len(no_logs)} "
+                f"FETCH_FAILED={len(fetch_failed)}"
+            ),
+            "",
+        ]
 
-        lines = [f"🔍 扫描完成：{len(all_services)} 个服务，{len(has_errors)} 个有错误\n"]
-        for label, errors in has_errors:
-            lines.append(f"❌ {label}")
-            lines.extend(errors[-10:])
+        if has_errors:
+            for label, errors in has_errors:
+                lines.append(f"ERROR_MATCH: {label}")
+                lines.extend(errors[-10:])
+                lines.append("")
+
+        if no_logs:
+            lines.append(f"NO_LOGS: {', '.join(no_logs)}")
+            lines.append("")
+
+        if fetch_failed:
+            for label, error_class, error in fetch_failed:
+                lines.append(f"FETCH_FAILED: {label} class={error_class} detail={error}")
             lines.append("")
 
         if clean:
-            lines.append(f"✅ 正常: {', '.join(clean)}")
+            lines.append(f"CLEAN: {', '.join(clean)}")
+            lines.append("")
 
-        return "\n".join(lines)
+        all_healthy = not has_errors and not no_logs and not fetch_failed and bool(clean)
+        if all_healthy:
+            lines.insert(
+                1,
+                f"✅ CLEAN: {len(clean)} 个服务均有运行时日志且未匹配错误关键词",
+            )
+        elif not has_errors and not clean and not no_logs and fetch_failed:
+            lines.insert(1, "没有成功读取任何运行时日志")
+
+        return "\n".join(lines).rstrip()
     except Exception as e:
-        return _err("scan_all_logs", e)
+        return f"status={STATUS_IMPLEMENTATION_ERROR}\n" + _err("scan_all_logs", e)
 
 
 @mcp.tool()
@@ -704,6 +1268,147 @@ async def set_service_env_var(
             service_id=service_id,
             environment_id=environment_id,
             key=key,
+        )
+
+
+@mcp.tool()
+async def get_service_env_var(service_id: str, environment_id: str, key: str) -> str:
+    """Read one environment variable from a service/environment.
+
+    Uses a dedicated read query (does not reuse set_service_env_var).
+    Exact key match. Sensitive keys return PRESENT/ABSENT only, never the value.
+    Absent keys return ABSENT_FROM_SERVICE_ENV with source/effective_default=UNKNOWN.
+    """
+    try:
+        data = await gql(
+            Q_GET_SERVICE_ENV_VAR,
+            {"serviceID": service_id, "environmentID": environment_id},
+            redact_response=True,
+        )
+        entries = _service_variables_entries(data)
+        if entries is None:
+            return _format_classified_failure(
+                classify_api_failure(data) if "error" in data else STATUS_API_ERROR,
+                data if "error" in data else {"error": "service env lookup failed"},
+                service_id=service_id,
+                environment_id=environment_id,
+                key=key,
+            )
+        match = next((item for item in entries if item.get("key") == key), None)
+        if match is None:
+            return (
+                "status=ABSENT_FROM_SERVICE_ENV\n"
+                f"key={key}\n"
+                "source=UNKNOWN\n"
+                "effective_default=UNKNOWN"
+            )
+        if _env_key_is_sensitive(key):
+            return f"status=PRESENT\nkey={key}"
+        value = match.get("value")
+        if value is None:
+            value = ""
+        return (
+            "status=PRESENT\n"
+            f"key={key}\n"
+            f"value={value}\n"
+            "source=UNKNOWN\n"
+            "effective_default=UNKNOWN"
+        )
+    except Exception as e:
+        return (
+            f"status={STATUS_IMPLEMENTATION_ERROR}\n"
+            + _err(
+                "get_service_env_var",
+                e,
+                service_id=service_id,
+                environment_id=environment_id,
+                key=key,
+            )
+        )
+
+
+@mcp.tool()
+async def get_service_metrics(
+    service_id: str,
+    environment_id: str,
+    project_id: str,
+    metric_type: str,
+    start_time: str | None = None,
+    end_time: str | None = None,
+) -> str:
+    """Read one service metric series (CPU / MEMORY / NETWORK / DISK / LATENCY).
+
+    Does not infer OOM, uptime, or restart count from the series.
+    start_time / end_time default to the last hour (ISO 8601), matching official ai-sdk.
+    """
+    try:
+        if metric_type not in SERVICE_METRIC_TYPES:
+            return (
+                f"status={STATUS_UNSUPPORTED}\n"
+                f"metric_type={metric_type}\n"
+                f"supported={','.join(sorted(SERVICE_METRIC_TYPES))}"
+            )
+        now = datetime.now(timezone.utc)
+        resolved_end = end_time or now.isoformat()
+        resolved_start = start_time or (now - timedelta(hours=1)).isoformat()
+        data = await gql(
+            Q_GET_SERVICE_METRICS,
+            {
+                "serviceID": service_id,
+                "environmentID": environment_id,
+                "projectID": project_id,
+                "metricType": metric_type,
+                "startTime": resolved_start,
+                "endTime": resolved_end,
+            },
+        )
+        if "error" in data:
+            return _format_classified_failure(
+                classify_api_failure(data),
+                data,
+                service_id=service_id,
+                metric_type=metric_type,
+            )
+        service = data.get("service")
+        if not isinstance(service, dict):
+            return _format_classified_failure(
+                STATUS_API_ERROR,
+                {"error": "service missing from metrics response"},
+                service_id=service_id,
+            )
+        points = service.get("metrics")
+        if points is None:
+            points = []
+        if not isinstance(points, list):
+            return _format_classified_failure(
+                STATUS_API_ERROR,
+                {"error": "metrics is not a list"},
+                service_id=service_id,
+            )
+        lines = [
+            f"status={STATUS_OK}",
+            f"metric_type={metric_type}",
+            f"count={len(points)}",
+            f"start_time={resolved_start}",
+            f"end_time={resolved_end}",
+        ]
+        for point in points:
+            if not isinstance(point, dict):
+                continue
+            ts = point.get("timestamp") or ""
+            lines.append(f"[{ts}] {point.get('value', '')}")
+        return "\n".join(lines)
+    except Exception as e:
+        return (
+            f"status={STATUS_IMPLEMENTATION_ERROR}\n"
+            + _err(
+                "get_service_metrics",
+                e,
+                service_id=service_id,
+                environment_id=environment_id,
+                project_id=project_id,
+                metric_type=metric_type,
+            )
         )
 
 

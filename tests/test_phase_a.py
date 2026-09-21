@@ -45,7 +45,12 @@ WRITE_TWO = {
     "set_service_env_var",
 }
 
-EXPECTED_REGISTERED = PHASE_A_NINE | WRITE_TWO
+READ_ONLY_OPS_TWO = {
+    "get_service_env_var",
+    "get_service_metrics",
+}
+
+EXPECTED_REGISTERED = PHASE_A_NINE | WRITE_TWO | READ_ONLY_OPS_TWO
 
 DEFER_OR_REJECT = {
     "search_template",
@@ -108,7 +113,8 @@ def test_complete_inventory_is_exactly_expected():
     assert PHASE_A_NINE <= names
     assert WRITE_TWO <= names
     assert names == EXPECTED_REGISTERED
-    assert len(names) == 11
+    assert len(names) == 13
+    assert READ_ONLY_OPS_TWO <= names
 
 
 def test_defer_and_reject_tools_are_not_registered():
@@ -188,6 +194,8 @@ def _patch_client(handler):
         (lambda: main.get_service("svc1"), "get_service"),
         (lambda: main.list_regions(), "list_regions"),
         (lambda: main.get_me(), "get_me"),
+        (lambda: main.get_service_env_var("svc1", "env1", "FOO"), "get_service_env_var"),
+        (lambda: main.get_service_metrics("svc1", "env1", "proj1", "CPU"), "get_service_metrics"),
     ],
 )
 def test_tools_post_only_intended_readonly_query(tool_coro, expected_op):
