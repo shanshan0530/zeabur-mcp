@@ -34,8 +34,8 @@ Q_LIST_SERVICES = """
         """
 
 Q_GET_RUNTIME_LOGS = """
-            query RuntimeLogs($projectID: ObjectID!, $serviceID: ObjectID!, $environmentID: ObjectID!) {
-              runtimeLogs(projectID: $projectID, serviceID: $serviceID, environmentID: $environmentID) {
+            query RuntimeLogs($projectID: ObjectID!, $serviceID: ObjectID!, $environmentID: ObjectID!, $deploymentID: ObjectID, $timestampCursor: Time) {
+              runtimeLogs(projectID: $projectID, serviceID: $serviceID, environmentID: $environmentID, deploymentID: $deploymentID, timestampCursor: $timestampCursor) {
                 message
                 timestamp
               }
@@ -46,7 +46,7 @@ Q_GET_DEPLOYMENTS = """
             query Deployments($serviceID: ObjectID!, $environmentID: ObjectID!) {
               deployments(serviceID: $serviceID, environmentID: $environmentID) {
                 edges {
-                  node { _id status createdAt }
+                  node { _id status createdAt startedAt finishedAt }
                 }
               }
             }
@@ -141,6 +141,45 @@ Q_SERVICE_VARIABLE_KEYS = """
             }
         """
 
+# Dedicated env READ. Official ai-sdk ServiceVariables query (key + value).
+# Do not reuse Q_SERVICE_VARIABLE_KEYS or set_service_env_var(confirm=false).
+Q_GET_SERVICE_ENV_VAR = """
+            query ServiceEnvVar($serviceID: ObjectID!, $environmentID: ObjectID!) {
+              service(_id: $serviceID) {
+                _id
+                variables(environmentID: $environmentID) {
+                  key
+                  value
+                }
+              }
+            }
+        """
+
+# Official ai-sdk GetMetrics query. Read-only; do not infer OOM/uptime/restarts.
+Q_GET_SERVICE_METRICS = """
+            query GetMetrics(
+              $serviceID: ObjectID!
+              $environmentID: ObjectID!
+              $endTime: Time!
+              $startTime: Time!
+              $metricType: MetricType!
+              $projectID: ObjectID!
+            ) {
+              service(_id: $serviceID) {
+                metrics(
+                  endTime: $endTime
+                  startTime: $startTime
+                  environmentID: $environmentID
+                  metricType: $metricType
+                  projectID: $projectID
+                ) {
+                  timestamp
+                  value
+                }
+              }
+            }
+        """
+
 # Map of every GraphQL query the MCP tools may send. Query-only.
 GRAPHQL_DOCUMENTS = {
     "list_projects": Q_LIST_PROJECTS,
@@ -155,6 +194,8 @@ GRAPHQL_DOCUMENTS = {
     "list_regions": Q_LIST_REGIONS,
     "get_me": Q_GET_ME,
     "service_variable_keys": Q_SERVICE_VARIABLE_KEYS,
+    "get_service_env_var": Q_GET_SERVICE_ENV_VAR,
+    "get_service_metrics": Q_GET_SERVICE_METRICS,
 }
 
 # Approved write mutations only. Do not add restart, deploy-from-spec,
