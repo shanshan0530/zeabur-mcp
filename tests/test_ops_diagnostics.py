@@ -17,6 +17,7 @@ from graphql_ops import GRAPHQL_DOCUMENTS, MUTATION_DOCUMENTS
 
 from tests.test_phase_a import (
     EXPECTED_REGISTERED,
+    PROBE_ONE,
     READ_ONLY_OPS_TWO,
     WRITE_TWO,
     _FakeResponse,
@@ -41,12 +42,13 @@ def _gql_mock(handler):
     return fake
 
 
-def test_tool_inventory_is_thirteen_with_two_new_read_tools():
+def test_tool_inventory_is_fourteen_with_probe_and_no_public_exec():
     names = _tool_names()
     assert names == EXPECTED_REGISTERED
-    assert len(names) == 13
+    assert len(names) == 14
     assert READ_ONLY_OPS_TWO <= names
     assert WRITE_TWO <= names
+    assert PROBE_ONE <= names
     assert "execute_command" not in names
     assert "executeCommand" not in names
     assert "network_probe" not in names
@@ -62,22 +64,23 @@ def test_graphql_documents_remain_queries_and_mutations_unchanged():
         "redeploy_service",
         "create_environment_variable",
         "update_single_environment_variable",
+        "execute_command",
     }
     assert "get_service_env_var" in GRAPHQL_DOCUMENTS
     assert "get_service_metrics" in GRAPHQL_DOCUMENTS
     joined_mut = "\n".join(MUTATION_DOCUMENTS.values())
-    assert "executeCommand" not in joined_mut
+    assert "executeCommand" in MUTATION_DOCUMENTS["execute_command"]
+    assert "executeCommand" not in MUTATION_DOCUMENTS["redeploy_service"]
     assert "restartService" not in joined_mut
     assert "redeployService" in joined_mut
 
 
-def test_no_execute_command_or_restart_or_new_write_in_source():
-    sources = [
-        (ROOT / "main.py").read_text(encoding="utf-8"),
-        (ROOT / "graphql_ops.py").read_text(encoding="utf-8"),
-    ]
-    for text in sources:
-        assert "executeCommand" not in text
+def test_no_restart_or_unapproved_write_in_source():
+    main_src = (ROOT / "main.py").read_text(encoding="utf-8")
+    gql_src = (ROOT / "graphql_ops.py").read_text(encoding="utf-8")
+    assert "executeCommand" not in main_src
+    assert "executeCommand" in gql_src
+    for text in (main_src, gql_src):
         assert "restartService" not in text
         assert "network_probe" not in text
         assert "deployFromSpecification" not in text
@@ -782,4 +785,5 @@ def test_no_inline_mutations_or_execute_command_in_main():
     assert "gql(\"\"\"" not in source
     assert "executeCommand" not in source
     assert not re.search(r"\bnetwork_probe\b", source)
+    assert not re.search(r"\bexecute_command\b", source)
     assert "没有运行时日志" not in source

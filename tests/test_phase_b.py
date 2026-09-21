@@ -24,6 +24,7 @@ from graphql_ops import GRAPHQL_DOCUMENTS, MUTATION_DOCUMENTS
 from tests.test_phase_a import (
     EXPECTED_REGISTERED,
     PHASE_A_NINE,
+    PROBE_ONE,
     READ_ONLY_OPS_TWO,
     TEST_SECRET,
     TEST_TOKEN,
@@ -148,12 +149,13 @@ def test_original_nine_tools_remain_with_unchanged_signatures():
     assert build_props["errors_only"]["default"] is True
 
 
-def test_exactly_two_write_tools_and_inventory_is_thirteen():
+def test_exactly_two_write_tools_and_inventory_is_fourteen():
     names = _tool_names()
     assert names == EXPECTED_REGISTERED
-    assert len(names) == 13
-    assert names - PHASE_A_NINE - READ_ONLY_OPS_TWO == WRITE_TWO
+    assert len(names) == 14
+    assert names - PHASE_A_NINE - READ_ONLY_OPS_TWO - PROBE_ONE == WRITE_TWO
     assert READ_ONLY_OPS_TWO <= names
+    assert PROBE_ONE <= names
     tools = {t.name: t for t in asyncio.run(main.mcp.list_tools())}
     for write_name in WRITE_TWO:
         schema = tools[write_name].inputSchema
@@ -198,6 +200,7 @@ def test_write_registry_contains_only_approved_mutations():
         "redeploy_service",
         "create_environment_variable",
         "update_single_environment_variable",
+        "execute_command",
     }
     for name, document in MUTATION_DOCUMENTS.items():
         stripped = document.strip()
@@ -662,7 +665,7 @@ def test_no_mutation_or_network_at_import_or_list_tools():
     finally:
         main.gql = original  # type: ignore[method-assign]
     assert posted == []
-    assert len(names) == 13
+    assert len(names) == 14
 
 
 def test_existing_url_token_read_behavior_still_works(monkeypatch):

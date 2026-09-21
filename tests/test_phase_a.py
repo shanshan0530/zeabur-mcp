@@ -50,7 +50,11 @@ READ_ONLY_OPS_TWO = {
     "get_service_metrics",
 }
 
-EXPECTED_REGISTERED = PHASE_A_NINE | WRITE_TWO | READ_ONLY_OPS_TWO
+PROBE_ONE = {
+    "probe_service_network",
+}
+
+EXPECTED_REGISTERED = PHASE_A_NINE | WRITE_TWO | READ_ONLY_OPS_TWO | PROBE_ONE
 
 DEFER_OR_REJECT = {
     "search_template",
@@ -113,8 +117,9 @@ def test_complete_inventory_is_exactly_expected():
     assert PHASE_A_NINE <= names
     assert WRITE_TWO <= names
     assert names == EXPECTED_REGISTERED
-    assert len(names) == 13
+    assert len(names) == 14
     assert READ_ONLY_OPS_TWO <= names
+    assert PROBE_ONE <= names
 
 
 def test_defer_and_reject_tools_are_not_registered():
