@@ -200,6 +200,8 @@ GRAPHQL_DOCUMENTS = {
 
 # Approved write mutations only. Do not add restart, deploy-from-spec,
 # bulk env-var map updates, or delete-variable operations.
+# executeCommand is INTERNAL plumbing for probe_service_network only.
+# Do not register a public execute_command tool.
 M_REDEPLOY_SERVICE = """
             mutation RedeployService(
               $serviceID: ObjectID!,
@@ -254,8 +256,30 @@ M_UPDATE_SINGLE_ENVIRONMENT_VARIABLE = """
             }
         """
 
+# Official ai-sdk / public-api executeCommand. command is argv [String!]!,
+# never a caller-supplied shell string. Used only by probe_service_network.
+EXECUTE_COMMAND_RESULT_FIELD = "executeCommand"
+
+M_EXECUTE_COMMAND = """
+            mutation ExecuteCommand(
+              $serviceID: ObjectID!,
+              $environmentID: ObjectID!,
+              $command: [String!]!
+            ) {
+              executeCommand(
+                serviceID: $serviceID,
+                environmentID: $environmentID,
+                command: $command
+              ) {
+                exitCode
+                output
+              }
+            }
+        """
+
 MUTATION_DOCUMENTS = {
     "redeploy_service": M_REDEPLOY_SERVICE,
     "create_environment_variable": M_CREATE_ENVIRONMENT_VARIABLE,
     "update_single_environment_variable": M_UPDATE_SINGLE_ENVIRONMENT_VARIABLE,
+    "execute_command": M_EXECUTE_COMMAND,
 }

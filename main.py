@@ -17,8 +17,11 @@ from starlette.routing import Mount
 
 import oauth
 from authorize_page import render_authorize_page
+import probe_program
 from graphql_ops import (
+    EXECUTE_COMMAND_RESULT_FIELD,
     M_CREATE_ENVIRONMENT_VARIABLE,
+    M_EXECUTE_COMMAND,
     M_REDEPLOY_SERVICE,
     M_UPDATE_SINGLE_ENVIRONMENT_VARIABLE,
     Q_GET_BUILD_LOGS,
@@ -289,6 +292,86 @@ def _write_preflight(ctx) -> str | None:
     if not MCP_WRITES_ENABLED:
         return "❌ Writes are disabled (MCP_WRITES_ENABLED); write refused"
     return None
+
+
+# Fixed in-container probe source. Caller values are never interpolated into this text.
+with open(probe_program.__file__, encoding="utf-8") as _probe_program_file:
+    PROBE_PROGRAM_SOURCE = _probe_program_file.read()
+
+MAX_PROBE_OUTPUT_CHARS = 4096
+PROBE_RUNTIMES = ("python3", "python")
+_RUNTIME_MISSING_MARKERS = (
+    "no such file or directory",
+    "command not found",
+    "executable file not found",
+    "not found",
+)
+
+
+def _bound_probe_output(text: str) -> str:
+    if text is None:
+        return ""
+    if len(text) <= MAX_PROBE_OUTPUT_CHARS:
+        return text
+    return text[:MAX_PROBE_OUTPUT_CHARS] + "\ntruncated=true\n"
+
+
+def _probe_argv(runtime: str, host: str, port: int, https_url: str | None) -> list[str]:
+    return [
+        runtime,
+        "-c",
+        PROBE_PROGRAM_SOURCE,
+        host,
+        str(port),
+        https_url or "",
+    ]
+
+
+def _format_invalid_target(reason: str) -> str:
+    return (
+        f"status={probe_program.STATUS_INVALID_TARGET}\n"
+        f"failed_stage={probe_program.STAGE_TARGET}\n"
+        f"error_class={probe_program.STATUS_INVALID_TARGET}\n"
+        f"reason={reason}"
+    )
+
+
+def _format_probe_class(code: str, **extra) -> str:
+    lines = [f"status={code}", f"error_class={code}"]
+    for key, value in extra.items():
+        if value is not None:
+            lines.append(f"{key}={value}")
+    return "\n".join(lines)
+
+
+def _is_structured_probe_output(output: str) -> bool:
+    stripped = (output or "").lstrip()
+    return stripped.startswith("status=")
+
+
+def _runtime_unavailable(exit_code, output: str) -> bool:
+    """True only when the interpreter itself is missing. Structured probe
+    output means the fixed program ran and must not trigger fallback.
+    """
+    if _is_structured_probe_output(output):
+        return False
+    if exit_code in (126, 127):
+        return True
+    lower = (output or "").lower()
+    if not lower:
+        return False
+    mentions_python = "python3" in lower or "python" in lower
+    if mentions_python and any(marker in lower for marker in _RUNTIME_MISSING_MARKERS):
+        return True
+    return False
+
+
+def _gql_error_is_runtime_missing(data: dict) -> bool:
+    text = _error_text(data.get("error")).lower()
+    if not text:
+        return False
+    mentions_python = "python3" in text or "python" in text
+    return mentions_python and any(marker in text for marker in _RUNTIME_MISSING_MARKERS)
 
 
 # ── Read-only ops helpers ─────────────────────────────────────────────────
@@ -1408,6 +1491,115 @@ async def get_service_metrics(
                 environment_id=environment_id,
                 project_id=project_id,
                 metric_type=metric_type,
+            )
+        )
+
+
+@mcp.tool()
+async def probe_service_network(
+    service_id: str,
+    environment_id: str,
+    target_host: str,
+    ctx: Context,
+    target_port: int = 443,
+    https_url: str | None = None,
+) -> str:
+    """Diagnose upstream DNS/TCP/TLS/HTTPS latency from a Zeabur service container.
+
+    Runs a fixed stdlib probe inside the target service. The caller cannot supply a
+    command, script, headers, or request body. Requires OPERATOR capability and
+    MCP_WRITES_ENABLED. Target access is whatever ZEABUR_TOKEN itself can reach.
+    """
+    try:
+        refusal = _write_preflight(ctx)
+        if refusal:
+            return refusal
+
+        url = https_url.strip() if isinstance(https_url, str) and https_url.strip() else None
+        reason = probe_program.validate_target(target_host, target_port, url)
+        if reason:
+            return _format_invalid_target(reason)
+
+        last_runtime_note = None
+        for index, runtime in enumerate(PROBE_RUNTIMES):
+            argv = _probe_argv(runtime, target_host, int(target_port), url)
+            data = await gql(
+                M_EXECUTE_COMMAND,
+                {
+                    "serviceID": service_id,
+                    "environmentID": environment_id,
+                    "command": argv,
+                },
+            )
+            if "error" in data:
+                if index == 0 and _gql_error_is_runtime_missing(data):
+                    last_runtime_note = _error_text(data.get("error"))
+                    continue
+                return _format_probe_class(
+                    "ZEABUR_EXEC_ERROR",
+                    failed_stage="EXEC",
+                    service_id=service_id,
+                    environment_id=environment_id,
+                    detail=_error_text(data.get("error")),
+                )
+
+            payload = data.get(EXECUTE_COMMAND_RESULT_FIELD)
+            if not isinstance(payload, dict):
+                return _format_probe_class(
+                    "ZEABUR_EXEC_ERROR",
+                    failed_stage="EXEC",
+                    service_id=service_id,
+                    environment_id=environment_id,
+                    detail="execute result missing",
+                )
+
+            exit_code = payload.get("exitCode")
+            output = _bound_probe_output(payload.get("output") or "")
+            if _runtime_unavailable(exit_code, output):
+                last_runtime_note = output or f"exit_code={exit_code}"
+                if index == 0:
+                    continue
+                return _format_probe_class(
+                    "PROBE_RUNTIME_UNAVAILABLE",
+                    failed_stage="RUNTIME",
+                    service_id=service_id,
+                    environment_id=environment_id,
+                    detail=last_runtime_note,
+                )
+
+            if _is_structured_probe_output(output):
+                lines = output.rstrip("\n")
+                extras = [
+                    f"exec_exit_code={exit_code}",
+                    f"runtime={runtime}",
+                ]
+                return lines + "\n" + "\n".join(extras)
+
+            return _format_probe_class(
+                "ZEABUR_EXEC_ERROR",
+                failed_stage="EXEC",
+                service_id=service_id,
+                environment_id=environment_id,
+                exec_exit_code=exit_code,
+                runtime=runtime,
+                detail=output or "empty probe output",
+            )
+
+        return _format_probe_class(
+            "PROBE_RUNTIME_UNAVAILABLE",
+            failed_stage="RUNTIME",
+            service_id=service_id,
+            environment_id=environment_id,
+            detail=last_runtime_note,
+        )
+    except Exception as e:
+        return (
+            f"status=IMPLEMENTATION_ERROR\nerror_class=IMPLEMENTATION_ERROR\n"
+            + _err(
+                "probe_service_network",
+                e,
+                service_id=service_id,
+                environment_id=environment_id,
             )
         )
 
