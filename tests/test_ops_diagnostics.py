@@ -524,6 +524,84 @@ def test_scan_async_exception_is_fetch_failed_not_skipped():
     assert "所有服务正常" not in result
 
 
+def test_scan_exactly_one_service_query_per_project_environment():
+    posted_service_vars = []
+
+    async def handler(url, body, headers):
+        query = body["query"]
+        if query == graphql_ops.Q_SCAN_SERVICES:
+            posted_service_vars.append(dict(body.get("variables") or {}))
+            return _FakeResponse(
+                {"data": {"services": {"edges": [{"node": {"_id": "s1", "name": "web"}}]}}}
+            )
+        if query == graphql_ops.Q_SCAN_RUNTIME_LOGS:
+            return _FakeResponse(
+                {
+                    "data": {
+                        "runtimeLogs": [
+                            {"timestamp": "2026-01-01T00:00:00Z", "message": "ready"}
+                        ]
+                    }
+                }
+            )
+        return _FakeResponse(
+            {
+                "data": {
+                    "projects": {
+                        "edges": [
+                            {
+                                "node": {
+                                    "_id": "p1",
+                                    "name": "demo",
+                                    "environments": [
+                                        {"_id": "e1", "name": "production"},
+                                        {"_id": "e2", "name": "staging"},
+                                    ],
+                                }
+                            },
+                            {
+                                "node": {
+                                    "_id": "p2",
+                                    "name": "other",
+                                    "environments": [{"_id": "e3", "name": "production"}],
+                                }
+                            },
+                        ]
+                    }
+                }
+            }
+        )
+
+    with _patch_client(handler):
+        asyncio.run(main.scan_all_logs())
+
+    source = inspect.getsource(main.scan_all_logs)
+    assert source.count("gql(Q_SCAN_SERVICES") == 1
+    assert len(posted_service_vars) == 3
+    assert posted_service_vars.count({"projectID": "p1"}) == 2
+    assert posted_service_vars.count({"projectID": "p2"}) == 1
+
+
+def test_deployment_query_contains_cli_proven_fields():
+    query = graphql_ops.Q_GET_DEPLOYMENTS
+    for field in (
+        "_id",
+        "status",
+        "createdAt",
+        "startedAt",
+        "finishedAt",
+        "ref",
+        "commitSHA",
+        "commitMessage",
+        "scheduledAt",
+    ):
+        assert field in query
+    assert "exitCode" not in query
+    assert "restartReason" not in query
+    assert "restartCount" not in query
+    assert query.strip().lower().startswith("query")
+
+
 def test_deployments_show_source_proven_timestamps():
     async def handler(url, body, headers):
         assert body["query"] == graphql_ops.Q_GET_DEPLOYMENTS
@@ -531,8 +609,13 @@ def test_deployments_show_source_proven_timestamps():
         assert body["variables"] == {"serviceID": SVC, "environmentID": ENV}
         assert "startedAt" in body["query"]
         assert "finishedAt" in body["query"]
-        assert "commit" not in body["query"].lower()
+        assert "ref" in body["query"]
+        assert "commitSHA" in body["query"]
+        assert "commitMessage" in body["query"]
+        assert "scheduledAt" in body["query"]
         assert "exitCode" not in body["query"]
+        assert "restartReason" not in body["query"]
+        assert "restartCount" not in body["query"]
         return _FakeResponse(
             {
                 "data": {
@@ -545,6 +628,10 @@ def test_deployments_show_source_proven_timestamps():
                                     "createdAt": "2026-01-01T00:00:00Z",
                                     "startedAt": "2026-01-01T00:00:05Z",
                                     "finishedAt": "2026-01-01T00:01:00Z",
+                                    "ref": "main",
+                                    "commitSHA": "abc123def456",
+                                    "commitMessage": "fix logs",
+                                    "scheduledAt": "2026-01-01T00:00:02Z",
                                 }
                             }
                         ]
@@ -557,9 +644,14 @@ def test_deployments_show_source_proven_timestamps():
         result = asyncio.run(main.get_deployments(SVC, ENV, PROJ))
     assert "startedAt: 2026-01-01T00:00:05Z" in result
     assert "finishedAt: 2026-01-01T00:01:00Z" in result
+    assert "ref: main" in result
+    assert "commitSHA: abc123def456" in result
+    assert "commitMessage: fix logs" in result
+    assert "scheduledAt: 2026-01-01T00:00:02Z" in result
     assert "dep-1" in result
-    assert "commit" not in result.lower()
     assert "exit code" not in result.lower()
+    assert "restart reason" not in result.lower()
+    assert "restart count" not in result.lower()
 
 
 def test_deployments_missing_timestamps_are_unsupported():
@@ -586,6 +678,10 @@ def test_deployments_missing_timestamps_are_unsupported():
         result = asyncio.run(main.get_deployments(SVC, ENV, PROJ))
     assert "startedAt: UNSUPPORTED" in result
     assert "finishedAt: UNSUPPORTED" in result
+    assert "ref: UNSUPPORTED" in result
+    assert "commitSHA: UNSUPPORTED" in result
+    assert "commitMessage: UNSUPPORTED" in result
+    assert "scheduledAt: UNSUPPORTED" in result
 
 
 def test_service_metrics_query_is_readonly():

@@ -748,12 +748,13 @@ async def get_runtime_logs(
 
 @mcp.tool()
 async def get_deployments(service_id: str, environment_id: str, project_id: str) -> str:
-    """获取服务的部署列表（含 deployment_id、status、createdAt、startedAt、finishedAt）。
+    """获取服务的部署列表（含 deployment_id、status、createdAt、startedAt、finishedAt、
+    ref、commitSHA、commitMessage、scheduledAt）。
     查 build 日志前需先调用此工具获取 deployment_id。
     service_id / environment_id 用于查询。
     project_id is unused (kept for backward compatibility) and is not sent to the API.
-    Fields not returned by the API are reported as UNSUPPORTED; commit SHA / exit code
-    / restart reason are not inferred.
+    Fields not returned by the API are reported as UNSUPPORTED.
+    Restart reason, exit code, restart count, and deploy-vs-restart event type are not inferred.
     """
     try:
         data = await gql(Q_GET_DEPLOYMENTS, {"serviceID": service_id, "environmentID": environment_id})
@@ -772,7 +773,11 @@ async def get_deployments(service_id: str, environment_id: str, project_id: str)
             lines.append(
                 f"[{ts}] {n['status']}  deployment_id: {n['_id']}  "
                 f"startedAt: {_deployment_ts(n, 'startedAt')}  "
-                f"finishedAt: {_deployment_ts(n, 'finishedAt')}"
+                f"finishedAt: {_deployment_ts(n, 'finishedAt')}  "
+                f"ref: {_deployment_ts(n, 'ref')}  "
+                f"commitSHA: {_deployment_ts(n, 'commitSHA')}  "
+                f"commitMessage: {_deployment_ts(n, 'commitMessage')}  "
+                f"scheduledAt: {_deployment_ts(n, 'scheduledAt')}"
             )
         return "\n".join(lines)
     except Exception as e:

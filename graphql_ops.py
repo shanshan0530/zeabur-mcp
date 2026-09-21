@@ -46,7 +46,7 @@ Q_GET_DEPLOYMENTS = """
             query Deployments($serviceID: ObjectID!, $environmentID: ObjectID!) {
               deployments(serviceID: $serviceID, environmentID: $environmentID) {
                 edges {
-                  node { _id status createdAt startedAt finishedAt }
+                  node { _id status createdAt startedAt finishedAt ref commitSHA commitMessage scheduledAt }
                 }
               }
             }
